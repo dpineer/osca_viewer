@@ -7,13 +7,70 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 's3_signer.dart';
 
-// [新增]：任务取消令牌
-class TransferTask {
-  bool isCancelled = false;
-  void cancel() => isCancelled = true;
+// ==================== [新增] 高级传输状态机 ====================
+class PartInfo {
+  final int partNumber;
+  double progress;
+  String speed;
+  PartInfo(this.partNumber, this.progress, this.speed);
 }
 
-// [新增]：智能单位转换
+class TransferTask extends ChangeNotifier {
+  final String id = UniqueKey().toString();
+  final String fileName;
+  final bool isUpload;
+  
+  bool isCancelled = false;
+  bool isFinished = false;
+  bool isError = false;
+  String errorMessage = '';
+
+  double overallProgress = 0.0;
+  String overallSpeed = '等待中...';
+  
+  // 保存每个并发分块的独立进度
+  Map<int, PartInfo> parts = {};
+
+  TransferTask(this.fileName, {this.isUpload = true});
+
+  void updateOverall(double p, String s) {
+    overallProgress = p; overallSpeed = s; notifyListeners();
+  }
+
+  void updatePart(int partNum, double p, String s) {
+    if (!parts.containsKey(partNum)) {
+      parts[partNum] = PartInfo(partNum, p, s);
+    } else {
+      parts[partNum]!.progress = p; parts[partNum]!.speed = s;
+    }
+    notifyListeners(); // 通知 UI 局部刷新这个分块
+  }
+
+  void cancel() {
+    isCancelled = true; errorMessage = '用户已取消'; notifyListeners();
+  }
+
+  void complete() {
+    isFinished = true; overallProgress = 1.0; overallSpeed = '已完成'; notifyListeners();
+  }
+
+  void error(String msg) {
+    isError = true; errorMessage = msg; overallSpeed = '失败'; notifyListeners();
+  }
+}
+
+// 全局任务调度中心
+class TransferManager extends ChangeNotifier {
+  List<TransferTask> tasks =[];
+  
+  void addTask(TransferTask task) {
+    tasks.insert(0, task); // 新任务置顶
+    notifyListeners();
+  }
+  
+  int get activeCount => tasks.where((t) => !t.isFinished && !t.isError && !t.isCancelled).length;
+}
+
 String formatSize(double bytes) {
   if (bytes < 1024) return '${bytes.toStringAsFixed(0)} B';
   if (bytes < 1048576) return '${(bytes / 1024).toStringAsFixed(2)} KB';
@@ -30,6 +87,17 @@ class S3StorageService with ChangeNotifier {
   bool isInit = false; 
   
   bool get isConfigured => _ak != null && _sk != null && _endpoint != null && _bucket != null && currentBucket != null;
+
+  // [新增]: 获取文件的外部直链
+  String getShareUrl(String key) {
+    if (!isConfigured) return '';
+    final host = Uri.parse(_endpoint!).host;
+    final path = _encodePath(key);
+    return S3Signer.generatePresignedUrl(
+      endpoint: _endpoint!, host: host, path: path, ak: _ak!, sk: _sk!,
+    );
+  }
+
   static const int _partSize = 5 * 1024 * 1024; // 5MB 分片界限
 
   S3StorageService() { _loadConfig(); }
@@ -100,20 +168,22 @@ class S3StorageService with ChangeNotifier {
   }
 
 
+  // ==================== [修正] 递归删除并抹除 0 字节标记 ====================
   Future<void> deleteItem(String key, bool isDir) async {
     if (!isConfigured) return;
     final cleanKey = _sanitizeKey(key);
 
     if (isDir) {
-      // 【核心修复】：S3的文件夹需要带上尾部斜杠，否则会误删前缀相似的其他文件
+      // 保证文件夹删除操作一定带有后缀 '/'
       final dirPrefix = cleanKey.endsWith('/') ? cleanKey : '$cleanKey/';
       final items = await listFiles(dirPrefix);
       
-      // 递归先删除文件夹内部的内容
+      // 1. 递归先删除文件夹内部的所有文件/子目录
       for (final item in items) {
         await deleteItem(item['key']!, item['isDir']);
       }
-      // 内部文件清空后，必须删除文件夹自身的0字节标记对象，否则它在列表中永远存在
+      
+      // 2. 内部清空后，必须发起一次 DELETE 请求，抹除这个 0 字节的原生标记对象
       await _deleteSingleItem(dirPrefix, true);
     } else {
       await _deleteSingleItem(cleanKey, false);
@@ -142,42 +212,18 @@ class S3StorageService with ChangeNotifier {
   }
 
 
-  // ==================== [新增] 云端虚拟文件夹 VFS ====================
-  // 读取虚拟文件夹配置
-  Future<List<String>> _getVFSFolders() async {
-    try {
-      final host = Uri.parse(_endpoint!).host;
-      final path = _encodePath('.osca_vfs.json');
-      final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, ak: _ak!, sk: _sk!);
-      final res = await http.get(Uri.parse('$_endpoint$path'), headers: headers);
-      if (res.statusCode == 200) {
-        final map = jsonDecode(utf8.decode(res.bodyBytes));
-        return List<String>.from(map['folders'] ?? []);
-      }
-    } catch (_) {}
-    return[];
-  }
-
-  // 保存虚拟文件夹配置
-  Future<void> _saveVFSFolders(List<String> folders) async {
-    final payload = utf8.encode(jsonEncode({'folders': folders.toSet().toList()}));
-    await _uploadSingleFile('.osca_vfs.json', Uint8List.fromList(payload));
-  }
-
-  // 改造原有的创建文件夹方法
+  // ==================== [修正] 官方标准 S3 原生文件夹创建 ====================
   Future<void> createFolder(String currentPrefix, String folderName) async {
     if (!isConfigured) return;
     final cleanPrefix = _sanitizeKey(currentPrefix);
     String newKey = cleanPrefix + folderName;
-    if (!newKey.endsWith('/')) newKey += '/';
+    if (!newKey.endsWith('/')) newKey += '/'; // 官方要求：必须以 / 结尾
     
-    // 更新云端 VFS 配置
-    final folders = await _getVFSFolders();
-    folders.add(newKey);
-    await _saveVFSFolders(folders);
+    // 官方方案：直接调用 putObject，上传一个 0 字节的空内容
+    await _uploadSingleFile(newKey, Uint8List(0));
   }
 
-  // ==================== 改造获取列表 ====================
+  // ==================== [终极修复] 100% 容错解析原生目录标记 ====================
   Future<List<Map<String, dynamic>>> listFiles(String prefix) async {
     if (!isConfigured) throw Exception("请先配置账户");
     final cleanPrefix = _sanitizeKey(prefix);
@@ -195,60 +241,80 @@ class S3StorageService with ChangeNotifier {
       sk: _sk!,
     );
 
-    // 建议 Query 参数按字母排序拼接，防止偶发签名错误
     final sortedKeys = queryParams.keys.toList()..sort();
     final queryParts = sortedKeys.map((k) => '${S3Signer.uriEncode(k)}=${S3Signer.uriEncode(queryParams[k]!)}');
     final url = '$_endpoint$path?${queryParts.join('&')}';
     
     final response = await http.get(Uri.parse(url), headers: headers);
-
     if (response.statusCode != 200) throw Exception("列出文件失败: ${response.statusCode}");
 
-    // 【核心修复】：必须使用 utf8 解码 bodyBytes，否则中文文件名会被强制转为 Latin-1 乱码导致 404！
     final responseBody = utf8.decode(response.bodyBytes);
-
     List<Map<String, dynamic>> items =[];
-    final commonPrefixes = RegExp(r'<CommonPrefixes><Prefix>(.*?)</Prefix></CommonPrefixes>')
-        .allMatches(responseBody).map((m) => m.group(1)!).toList();
-    final contentsMatches = RegExp(r'<Contents>.*?<Key>(.*?)</Key>.*?<Size>(\d+)</Size>.*?<LastModified>(.*?)</LastModified>.*?</Contents>', dotAll: true)
-        .allMatches(responseBody);
 
-    for (final prefix in commonPrefixes) {
-      final name = prefix.replaceAll(cleanPrefix, '').replaceAll('/', '');
-      if (name.isNotEmpty) items.add({'name': name, 'isDir': true, 'size': 0, 'key': prefix});
-    }
-
-    for (final m in contentsMatches) {
-      final key = m.group(1)!;
-      final size = m.group(2)!;
-      final time = m.group(3)!;
-      final name = key.replaceAll(cleanPrefix, '');
-      
-      // 过滤掉当前目录自身的空对象标记
-      if (key != cleanPrefix && name.isNotEmpty) {
-        items.add({'name': name, 'isDir': false, 'size': int.parse(size), 'key': key, 'time': time});
+    // 1. 提取 CommonPrefixes 块 (无视换行符，dotAll: true 代表 . 可以匹配换行)
+    final commonPrefixesMatches = RegExp(r'<CommonPrefixes>(.*?)</CommonPrefixes>', dotAll: true).allMatches(responseBody);
+    for (final m in commonPrefixesMatches) {
+      final prefixBlock = m.group(1)!;
+      // 在块内单独提取 Prefix
+      final prefixMatch = RegExp(r'<Prefix>(.*?)</Prefix>').firstMatch(prefixBlock);
+      if (prefixMatch != null) {
+        final prefixStr = prefixMatch.group(1)!;
+        
+        String name = prefixStr;
+        // 安全地移除前缀路径
+        if (cleanPrefix.isNotEmpty && name.startsWith(cleanPrefix)) {
+          name = name.substring(cleanPrefix.length);
+        }
+        name = name.replaceAll('/', ''); // 仅保留单纯的文件夹名
+        
+        if (name.isNotEmpty && !items.any((e) => e['name'] == name && e['isDir'])) {
+          items.add({'name': name, 'isDir': true, 'size': 0, 'key': prefixStr});
+        }
       }
     }
-    
-    //[在此处追加 VFS 虚拟文件夹解析合并]:
-    final vfsFolders = await _getVFSFolders();
-    for (final f in vfsFolders) {
-      if (f.startsWith(cleanPrefix) && f != cleanPrefix) {
-        final relative = f.substring(cleanPrefix.length);
-        final name = relative.split('/').firstWhere((e) => e.isNotEmpty, orElse: () => '');
-        if (name.isNotEmpty && !items.any((e) => e['name'] == name && e['isDir'])) {
-          items.add({'name': name, 'isDir': true, 'size': 0, 'key': cleanPrefix + name + '/'});
+
+    // 2. 提取 Contents 块 (文件或当前层级的 0 字节原生目录标记)
+    final contentsMatches = RegExp(r'<Contents>(.*?)</Contents>', dotAll: true).allMatches(responseBody);
+    for (final m in contentsMatches) {
+      final contentBlock = m.group(1)!;
+      // 在块内单独提取各项属性，彻底无视节点排列顺序
+      final keyMatch = RegExp(r'<Key>(.*?)</Key>').firstMatch(contentBlock);
+      final sizeMatch = RegExp(r'<Size>(\d+)</Size>').firstMatch(contentBlock);
+      final timeMatch = RegExp(r'<LastModified>(.*?)</LastModified>').firstMatch(contentBlock);
+      
+      if (keyMatch != null && sizeMatch != null) {
+        final key = keyMatch.group(1)!;
+        final size = int.parse(sizeMatch.group(1)!);
+        final time = timeMatch?.group(1) ?? '';
+        
+        String name = key;
+        if (cleanPrefix.isNotEmpty && name.startsWith(cleanPrefix)) {
+          name = name.substring(cleanPrefix.length);
+        }
+        
+        // 过滤掉当前目录自身的 0 字节标记 (避免自己显示在自己里面)
+        if (key != cleanPrefix && name.isNotEmpty) {
+          // 判断是否为 S3 原生目录对象 (以 / 结尾)
+          if (key.endsWith('/')) {
+            final dirName = name.replaceAll('/', '');
+            if (!items.any((e) => e['name'] == dirName && e['isDir'])) {
+              items.add({'name': dirName, 'isDir': true, 'size': 0, 'key': key, 'time': time});
+            }
+          } else {
+            items.add({'name': name, 'isDir': false, 'size': size, 'key': key, 'time': time});
+          }
         }
       }
     }
     
-    // 过滤掉我们存放的系统级配置文件，不让用户看到
+    // 顺手屏蔽掉旧版本可能残留的 VFS 配置文件
     items.removeWhere((e) => e['name'] == '.osca_vfs.json');
     return items;
   }
 
   // ==================== 改造下载，支持取消和计算网速 ====================
-  Future<void> downloadFile(String key, String localPath, TransferTask task, Function(double, String) onProgress) async {
+// ==================== [重构] 下载支持后台流控 ====================
+  Future<void> downloadFile(String key, String localPath, TransferTask task) async {
     if (!isConfigured) return;
     final cleanKey = _sanitizeKey(key);
     final host = Uri.parse(_endpoint!).host;
@@ -256,8 +322,6 @@ class S3StorageService with ChangeNotifier {
     
     final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, ak: _ak!, sk: _sk!);
     final request = http.Request('GET', Uri.parse('$_endpoint$path'))..headers.addAll(headers);
-    
-    // 使用 Client 来保持连接以读取 stream
     final client = http.Client();
     final response = await client.send(request);
 
@@ -271,26 +335,22 @@ class S3StorageService with ChangeNotifier {
 
     try {
       await for (final chunk in response.stream) {
-        if (task.isCancelled) {
-          throw Exception("用户已取消任务");
-        }
+        if (task.isCancelled) throw Exception("用户取消");
         sink.add(chunk);
         downloadedSize += chunk.length;
         
         final elapsedSecs = (DateTime.now().millisecondsSinceEpoch - startTime) / 1000.0;
-        final speed = elapsedSecs > 0 ? '${formatSize(downloadedSize / elapsedSecs)}/s' : '计算中...';
-        
-        if (totalSize > 0) onProgress(downloadedSize / totalSize.toDouble(), speed);
+        final speed = elapsedSecs > 0 ? '${formatSize(downloadedSize / elapsedSecs)}/s' : '...';
+        if (totalSize > 0) task.updateOverall(downloadedSize / totalSize.toDouble(), speed);
       }
     } finally {
       await sink.close();
-      client.close(); // 释放资源
-      if (task.isCancelled && file.existsSync()) file.deleteSync(); // 取消时清理碎片
+      client.close();
+      if (task.isCancelled && file.existsSync()) file.deleteSync();
     }
   }
 
-  // ==================== 改造上传，支持取消和计算网速 ====================
-  Future<void> uploadFile(String localPath, String remoteKey, TransferTask task, Function(double, String) onProgress) async {
+  Future<void> uploadFile(String localPath, String remoteKey, TransferTask task) async {
     if (!isConfigured) return;
     final cleanKey = _sanitizeKey(remoteKey);
     final file = File(localPath);
@@ -299,64 +359,103 @@ class S3StorageService with ChangeNotifier {
     if (fileSize <= _partSize) {
       final bytes = await file.readAsBytes();
       await _uploadSingleFile(cleanKey, bytes);
-      onProgress(1.0, '完成');
+      task.complete();
     } else {
-      await _uploadMultipartFile(file, cleanKey, fileSize, task, onProgress);
+      await _uploadMultipartFile(file, cleanKey, fileSize, task);
     }
   }
 
   /// [核心新增] OSCA > 100M 多分片上传支持
-  Future<void> _uploadMultipartFile(File file, String key, int fileSize, TransferTask task, Function(double, String) onProgress) async {
+  // ====================[终极优化] 并发分片加速上传引擎 ====================
+  // ==================== [重构] 多并发分片引擎带微观字节监控 ====================
+  // ==================== [终极进化] 真实网络背压与滑动窗口并发引擎 ====================
+  Future<void> _uploadMultipartFile(File file, String key, int fileSize, TransferTask task) async {
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
 
-    // 1. Initiate
-    final initQueryParams = {'uploads': ''};
-    final initHeaders = S3Signer.generateV4Headers(
-      method: 'POST', host: host, path: path, queryParams: initQueryParams, ak: _ak!, sk: _sk!,
-    );
+    final initHeaders = S3Signer.generateV4Headers(method: 'POST', host: host, path: path, queryParams: {'uploads': ''}, ak: _ak!, sk: _sk!);
     final initRes = await http.post(Uri.parse('$_endpoint$path?uploads='), headers: initHeaders);
     if (initRes.statusCode != 200) throw Exception("初始化分片失败");
     final uploadId = RegExp(r'<UploadId>(.*?)</UploadId>').firstMatch(initRes.body)!.group(1)!;
 
-    // 2. Upload Parts
     List<Map<String, dynamic>> uploadedParts =[];
-    int uploadedBytes = 0;
+    int totalUploadedBytes = 0;
     int partNumber = 1;
     List<int> currentChunk =[];
     
-    final startTime = DateTime.now().millisecondsSinceEpoch;
+    final overallStartTime = DateTime.now().millisecondsSinceEpoch;
+
+    // 每次流向真实网卡写入数据时更新总进度
+    void onBytesSent(int bytesCount) {
+      totalUploadedBytes += bytesCount;
+      final elapsedSecs = (DateTime.now().millisecondsSinceEpoch - overallStartTime) / 1000.0;
+      final speed = elapsedSecs > 0 ? '${formatSize(totalUploadedBytes / elapsedSecs)}/s' : '...';
+      task.updateOverall(totalUploadedBytes / fileSize.toDouble(), speed);
+    }
+
+    // [核心改进]：滑动窗口控制器
+    int activeUploads = 0;
+    List<Future<void>> allTasks =[];
+    bool hasError = false;
+    String errorMsg = "";
+
     await for (final chunk in file.openRead()) {
-      if (task.isCancelled) throw Exception("已取消上传");
+      if (task.isCancelled) throw Exception("用户取消");
+      if (hasError) throw Exception(errorMsg);
+      
       currentChunk.addAll(chunk);
+      
       while (currentChunk.length >= _partSize) {
         final chunkBytes = Uint8List.fromList(currentChunk.sublist(0, _partSize));
         currentChunk = currentChunk.sublist(_partSize);
-        await _sendPart(chunkBytes, partNumber, uploadId, path, host, uploadedParts);
-        uploadedBytes += chunkBytes.length;
-        final elapsedSecs = (DateTime.now().millisecondsSinceEpoch - startTime) / 1000.0;
-        final speed = elapsedSecs > 0 ? '${formatSize(uploadedBytes / elapsedSecs)}/s' : '计算中...';
-        onProgress(uploadedBytes / fileSize, speed);
-        partNumber++;
+        
+        // 滑动窗口检查：如果满4个车道，就微秒级挂起，一旦空出车道立刻无缝补上！
+        while (activeUploads >= 4 && !hasError && !task.isCancelled) {
+          await Future.delayed(const Duration(milliseconds: 10));
+        }
+        if (task.isCancelled || hasError) break;
+
+        activeUploads++;
+        final pNum = partNumber++;
+        
+        // 抛入后台独立运行，不阻塞文件读取
+        final future = _sendPart(chunkBytes, pNum, uploadId, path, host, uploadedParts, task, onBytesSent).then((_) {
+          activeUploads--; // 上传完毕，空出车道
+        }).catchError((e) {
+          hasError = true; errorMsg = e.toString(); activeUploads--;
+        });
+        
+        allTasks.add(future);
       }
     }
-    if (currentChunk.isNotEmpty) {
-      final chunkBytes = Uint8List.fromList(currentChunk);
-      await _sendPart(chunkBytes, partNumber, uploadId, path, host, uploadedParts);
-      uploadedBytes += chunkBytes.length;
-      final elapsedSecs = (DateTime.now().millisecondsSinceEpoch - startTime) / 1000.0;
-      final speed = elapsedSecs > 0 ? '${formatSize(uploadedBytes / elapsedSecs)}/s' : '计算中...';
-      onProgress(uploadedBytes / fileSize, speed);
+    
+    // 扫尾最后一个不规则的碎片
+    if (currentChunk.isNotEmpty && !hasError && !task.isCancelled) {
+      while (activeUploads >= 4 && !hasError && !task.isCancelled) {
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
+      activeUploads++;
+      allTasks.add(
+        _sendPart(Uint8List.fromList(currentChunk), partNumber, uploadId, path, host, uploadedParts, task, onBytesSent)
+        .then((_) => activeUploads--)
+        .catchError((e) { hasError = true; errorMsg = e.toString(); activeUploads--; })
+      );
     }
 
-    // 3. Complete
+    // 严谨等待所有车道的收尾工作
+    await Future.wait(allTasks);
+    
+    if (task.isCancelled) throw Exception("用户取消");
+    if (hasError) throw Exception(errorMsg);
+
+    // 必须按 PartNumber 正确排序合并
+    uploadedParts.sort((a, b) => (a['PartNumber'] as int).compareTo(b['PartNumber'] as int));
     final completeXml = _buildCompleteXml(uploadedParts);
-    final completeXmlBytes = utf8.encode(completeXml);
-    final completeHeaders = S3Signer.generateV4Headers(
-      method: 'POST', host: host, path: path, queryParams: {'uploadId': uploadId}, ak: _ak!, sk: _sk!, payloadBytes: completeXmlBytes,
-    );
-    final completeRes = await http.post(Uri.parse('$_endpoint$path?uploadId=$uploadId'), headers: completeHeaders, body: completeXmlBytes);
-    if (completeRes.statusCode != 200) throw Exception("合并分片失败: ${completeRes.body}");
+    final completeBytes = utf8.encode(completeXml);
+    
+    final completeHeaders = S3Signer.generateV4Headers(method: 'POST', host: host, path: path, queryParams: {'uploadId': uploadId}, ak: _ak!, sk: _sk!, payloadBytes: completeBytes);
+    final completeRes = await http.post(Uri.parse('$_endpoint$path?uploadId=$uploadId'), headers: completeHeaders, body: completeBytes);
+    if (completeRes.statusCode != 200) throw Exception("合并分片失败");
   }
 
   String _buildCompleteXml(List<Map<String, dynamic>> parts) {
@@ -392,17 +491,57 @@ class S3StorageService with ChangeNotifier {
     }
   }
 
-  Future<void> _sendPart(Uint8List chunkBytes, int partNumber, String uploadId, String path, String host, List<Map<String, dynamic>> uploadedParts) async {
-    final queryParams = {'partNumber': partNumber.toString(), 'uploadId': uploadId};
-    final headers = S3Signer.generateV4Headers(
-      method: 'PUT', host: host, path: path, queryParams: queryParams, ak: _ak!, sk: _sk!, payloadBytes: chunkBytes,
-    );
-    final url = '$_endpoint$path?partNumber=$partNumber&uploadId=$uploadId';
-    final partRes = await http.put(Uri.parse(url), headers: headers, body: chunkBytes);
-    if (partRes.statusCode != 200) throw Exception("分片 $partNumber 上传失败");
+  // ==================== [核心改进] 真实物理网卡级传输监控 ====================
+  Future<void> _sendPart(Uint8List chunkBytes, int pNum, String uploadId, String path, String host, List<Map<String, dynamic>> uploadedParts, TransferTask task, Function(int) onBytesSent) async {
+    final queryParams = {'partNumber': pNum.toString(), 'uploadId': uploadId};
+    final headers = S3Signer.generateV4Headers(method: 'PUT', host: host, path: path, queryParams: queryParams, ak: _ak!, sk: _sk!, payloadBytes: chunkBytes);
+    final url = '$_endpoint$path?partNumber=$pNum&uploadId=$uploadId';
     
-    final etag = partRes.headers['etag'] ?? partRes.headers['ETag'];
-    uploadedParts.add({'PartNumber': partNumber, 'ETag': etag});
+    final request = http.StreamedRequest('PUT', Uri.parse(url));
+    request.headers.addAll(headers);
+    request.contentLength = chunkBytes.length;
+    
+    int sentBytes = 0;
+    final startT = DateTime.now().millisecondsSinceEpoch;
+    
+    // 创建一个受 Dart HTTP 客户端物理限制的流
+    Stream<List<int>> streamData() async* {
+      const chunkSize = 64 * 1024; // 每次交给系统 64KB
+      for (int i = 0; i < chunkBytes.length; i += chunkSize) {
+        if (task.isCancelled) throw Exception("用户取消");
+        int end = (i + chunkSize < chunkBytes.length) ? i + chunkSize : chunkBytes.length;
+        final piece = chunkBytes.sublist(i, end);
+        
+        sentBytes += piece.length;
+        onBytesSent(piece.length); // 推送给总进度
+        
+        double elapsed = (DateTime.now().millisecondsSinceEpoch - startT) / 1000.0;
+        task.updatePart(pNum, sentBytes / chunkBytes.length, elapsed > 0 ? '${formatSize(sentBytes / elapsed)}/s' : '...');
+        
+        yield piece; // [关键点]: 只有当网络真的发出去后，框架才会索求下一次 yield！
+      }
+    }
+
+    // 绑定物理流并监听异常
+    request.sink.addStream(streamData()).then((_) {
+      request.sink.close();
+    }).catchError((e) {
+      request.sink.addError(e); request.sink.close();
+    });
+
+    final client = http.Client();
+    try {
+      final response = await client.send(request);
+      if (response.statusCode != 200) throw Exception("Part $pNum Failed: ${response.statusCode}");
+      
+      final etag = response.headers['etag'] ?? response.headers['ETag'];
+      if (etag != null) {
+        uploadedParts.add({'PartNumber': pNum, 'ETag': etag});
+      }
+      task.updatePart(pNum, 1.0, '完成');
+    } finally {
+      client.close(); // 释放连接
+    }
   }
 
   // --- [新增]: 重命名/移动文件 (复制 + 删除) ---

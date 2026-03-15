@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
 import 'services/s3_storage_service.dart';
 
 
@@ -15,6 +16,7 @@ void main() {
       providers: [
         ChangeNotifierProvider(create: (_) => ThemeProvider()),
         ChangeNotifierProvider(create: (_) => S3StorageService()),
+        ChangeNotifierProvider(create: (_) => TransferManager()), // [新增]
       ],
       child: MyApp(),
     ),
@@ -175,19 +177,16 @@ class _ConfigPageState extends State<ConfigPage> {
             ),
             Divider(height: 40),
             
-            // [新增]：VFS 虚拟目录机制说明
-              ListTile(
-                leading: Icon(Icons.cloud_sync, color: Colors.blue),
-                title: Text('OSCA VFS 虚拟文件系统增强', style: TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text(
-                  '针对 S3 对象存储扁平化命名空间（Flat Namespace）及缺乏原生目录实体的特性，\n'
-                  '本架构引入云端元数据索引 (.osca_vfs.json) 以构建虚拟目录树。\n'
-                  '• 支持空目录持久化：解决原生协议中空文件夹无法独立存在的限制。\n'
-                  '• 高效目录管理：通过更新元数据实现毫秒级目录创建与重组，避免大文件物理移动的高昂开销。\n'
-                  '• 交互一致性：提供符合本地文件系统直觉的层级视图，优化文件组织与管理效率。',
-                  style: TextStyle(fontSize: 12, height: 1.4),
-                ),
+            // [更新]：修改为 Native S3 目录机制说明
+            ListTile(
+              leading: Icon(Icons.info_outline, color: Colors.blue),
+              title: Text('标准 S3 目录架构', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(
+                '已接入 OSCA 官方规范：通过创建以 "/" 结尾的 0 字节对象来实现原生目录管理。'
+                '\n✓ 优点：底层直接采用 PutObject 接口，完美兼容各平台 S3 客户端，再也无需担心跨客户端时出现"幽灵文件"与配置不同步的问题。',
+                style: TextStyle(fontSize: 12),
               ),
+            ),
             SizedBox(height: 20),
           ],
         ),
@@ -392,6 +391,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
   }
 
   // [配套修改]: 下载方法不再需要 finally 去兜底关闭
+  // [重构]：彻底非阻塞的后台下载机制
   Future<void> _handleDownload(Map<String, dynamic> item) async {
     if (item['isDir']) {
       _showMsg("暂不支持直接下载整个文件夹", isError: true);
@@ -412,41 +412,38 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     }
 
     String localPath = p.join(localDir, item['name']);
-    final task = TransferTask();
-    
-    // 调用新的弹窗逻辑
-    _showProgressDialog("正在下载...", item['name'], task, (onProgressReady) async {
-      try {
-        await context.read<S3StorageService>().downloadFile(item['key'], localPath, task, onProgressReady);
-        if (!task.isCancelled) _showMsg("下载成功: $localPath");
-      } catch (e) {
-        if (!task.isCancelled) _showMsg("下载失败: $e", isError: true);
-      }
-    });
+    final task = TransferTask(item['name'], isUpload: false);
+    context.read<TransferManager>().addTask(task);
+    _showMsg("已加入下载队列，请点击右上角查看进度");
+
+    try {
+      await context.read<S3StorageService>().downloadFile(item['key'], localPath, task);
+      if (!task.isCancelled) task.complete();
+    } catch (e) {
+      if (!task.isCancelled) task.error(e.toString());
+    }
   }
 
-  // [配套修改]: 上传方法同理
+  // [重构]：非阻塞上传
   Future<void> _handleUpload() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles();
     if (result == null || result.files.single.path == null) return;
-
     String localPath = result.files.single.path!;
     String fileName = result.files.single.name;
-    String remoteKey = "$_currentPrefix$fileName";
+    
+    final task = TransferTask(fileName, isUpload: true);
+    context.read<TransferManager>().addTask(task);
+    _showMsg("已加入上传队列，正在后台极速并发上传");
 
-    final task = TransferTask();
-
-    _showProgressDialog("正在上传...", fileName, task, (onProgressReady) async {
-      try {
-        await context.read<S3StorageService>().uploadFile(localPath, remoteKey, task, onProgressReady);
-        if (!task.isCancelled) {
-          _showMsg("上传成功");
-          _loadFiles();
-        }
-      } catch (e) {
-        if (!task.isCancelled) _showMsg("上传失败: $e", isError: true);
+    try {
+      await context.read<S3StorageService>().uploadFile(localPath, "$_currentPrefix$fileName", task);
+      if (!task.isCancelled) {
+        task.complete();
+        _loadFiles(); // 成功后刷新列表
       }
-    });
+    } catch (e) {
+      if (!task.isCancelled) task.error(e.toString());
+    }
   }
 
   // [核心修复]: 重新设计的长任务进度弹窗
@@ -560,11 +557,110 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     return "${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB";
   }
 
+  // --- 底部弹出的专属任务监控控制台 ---
+  void _showTaskCenter() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => DraggableScrollableSheet(
+        initialChildSize: 0.6, minChildSize: 0.4, maxChildSize: 0.9,
+        builder: (_, controller) => Container(
+          decoration: BoxDecoration(
+            color: Theme.of(context).scaffoldBackgroundColor,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+          ),
+          child: Column(
+            children:[
+              Padding(
+                padding: EdgeInsets.all(16),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children:[
+                    Text('传输任务中心', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    IconButton(icon: Icon(Icons.close), onPressed: () => Navigator.pop(context)),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: Consumer<TransferManager>(
+                  builder: (context, manager, _) => ListView.builder(
+                    controller: controller,
+                    itemCount: manager.tasks.length,
+                    itemBuilder: (context, index) {
+                      final task = manager.tasks[index];
+                      // 局部监听单个任务的状态更新
+                      return ChangeNotifierProvider.value(
+                        value: task, 
+                        child: Consumer<TransferTask>(
+                          builder: (ctx, t, _) => Card(
+                            margin: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                            child: Padding(
+                              padding: EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children:[
+                                  Row(
+                                    children:[
+                                      Icon(t.isUpload ? Icons.upload : Icons.download, size: 20, color: Colors.blue),
+                                      SizedBox(width: 8),
+                                      Expanded(child: Text(t.fileName, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontWeight: FontWeight.bold))),
+                                      if (!t.isFinished && !t.isCancelled && !t.isError)
+                                        IconButton(icon: Icon(Icons.cancel, color: Colors.red, size: 20), onPressed: t.cancel, constraints: BoxConstraints())
+                                      else
+                                        Text(t.isFinished ? '完成' : (t.isError ? '失败' : '取消'), style: TextStyle(color: t.isFinished ? Colors.green : Colors.red, fontSize: 12)),
+                                    ],
+                                  ),
+                                  SizedBox(height: 8),
+                                  LinearProgressIndicator(value: t.overallProgress),
+                                  SizedBox(height: 4),
+                                  Text('${(t.overallProgress * 100).toStringAsFixed(1)}% - ${t.overallSpeed}', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                                  
+                                  // === 微观视角：多轨道分段进度监控 ===
+                                  if (t.isUpload && t.parts.isNotEmpty) ...[
+                                    Divider(),
+                                    Text('多车道并发引擎状态:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey)),
+                                    SizedBox(height: 6),
+                                    Wrap(
+                                      spacing: 8, runSpacing: 8,
+                                      children: t.parts.values.map((p) => 
+                                        Container(
+                                          width: 80, padding: EdgeInsets.all(6),
+                                          decoration: BoxDecoration(color: Colors.grey.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
+                                          child: Column(
+                                            children:[
+                                              Text('分片 ${p.partNumber}', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                                              SizedBox(height: 4),
+                                              LinearProgressIndicator(value: p.progress, minHeight: 3),
+                                              SizedBox(height: 2),
+                                              Text(p.speed, style: TextStyle(fontSize: 9, color: Colors.grey)),
+                                            ]
+                                          )
+                                        )
+                                      ).toList()
+                                    )
+                                  ]
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ],
+          ),
+        )
+      )
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        // [修改]: 支持搜索框切换
         title: _isSearching 
           ? TextField(
               autofocus: true,
@@ -573,8 +669,8 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
               onChanged: (val) => setState(() => _searchQuery = val),
             )
           : Text('OSCA - ${_currentPrefix.isEmpty ? '根目录' : _currentPrefix}', style: TextStyle(fontSize: 16)),
-        actions: [
-          // [新增]: 搜索切换按钮
+        actions:[
+          // 1. 搜索按钮
           IconButton(
             icon: Icon(_isSearching ? Icons.close : Icons.search),
             onPressed: () {
@@ -584,9 +680,35 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
               });
             },
           ),
-          // [新增]: 创建文件夹按钮
+          
+          // 2. 创建文件夹按钮
           IconButton(icon: Icon(Icons.create_new_folder), onPressed: _handleCreateFolder),
+          
+          // 3. 上传按钮
           IconButton(icon: Icon(Icons.upload), onPressed: _isLoading ? null : _handleUpload),
+          
+          // 4. [最核心的入口]：任务中心 (带红点角标)
+          Consumer<TransferManager>(
+            builder: (context, manager, _) => IconButton(
+              icon: Stack(
+                clipBehavior: Clip.none,
+                children:[
+                  Icon(Icons.swap_vert), // 上下文交换图标
+                  if (manager.activeCount > 0)
+                    Positioned(
+                      right: -4, top: -4,
+                      child: CircleAvatar(
+                        radius: 7, backgroundColor: Colors.red,
+                        child: Text('${manager.activeCount}', style: TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold)),
+                      )
+                    )
+                ]
+              ),
+              onPressed: () => _showTaskCenter(),
+            ),
+          ),
+          
+          // 5. 设置页入口
           IconButton(
             icon: Icon(Icons.settings),
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ConfigPage())),
@@ -620,6 +742,19 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                           tooltip: '属性与编辑',
                           onPressed: () => _showPropertiesDialog(item),
                         ),
+                        
+                        //[新增]: 复制外链按钮
+                        if (!item['isDir'])
+                          IconButton(
+                            icon: Icon(Icons.share, color: Colors.purple),
+                            tooltip: '复制外链',
+                            onPressed: () {
+                              final url = context.read<S3StorageService>().getShareUrl(item['key']);
+                              Clipboard.setData(ClipboardData(text: url));
+                              _showMsg("外链已复制到剪贴板，24小时内有效");
+                            },
+                          ),
+
                         if (!item['isDir'])
                           IconButton(
                             icon: Icon(Icons.download, color: Colors.blue),

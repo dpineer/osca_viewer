@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:intl/intl.dart';
-import 'package:flutter/foundation.dart';
 
 class S3Signer {
   /// S3 专用 URI 编码：符合 RFC 3986，不对 ~ 进行编码，将空格正确编码为 %20
@@ -88,5 +87,62 @@ class S3Signer {
     };
 
     return headers;
+  }
+
+  // [新增]: 生成基于 URL 参数的安全外链 (Presigned URL)
+  static String generatePresignedUrl({
+    required String endpoint,
+    required String host,
+    required String path,
+    required String ak,
+    required String sk,
+    int expiresIn = 86400, // 默认外链有效期：1天 (86400秒)
+  }) {
+    final now = DateTime.now().toUtc();
+    final amzDate = DateFormat("yyyyMMdd'T'HHmmss'Z'").format(now);
+    final dateStamp = DateFormat("yyyyMMdd").format(now);
+    const region = 'us-east-1';
+    const service = 's3';
+
+    final credential = '$ak/$dateStamp/$region/$service/aws4_request';
+    
+    // 对于 Presigned URL，认证信息不放在 Header，全放在 Query 中
+    final queryParams = {
+      'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+      'X-Amz-Credential': credential,
+      'X-Amz-Date': amzDate,
+      'X-Amz-Expires': expiresIn.toString(),
+      'X-Amz-SignedHeaders': 'host',
+    };
+
+    final sortedKeys = queryParams.keys.toList()..sort();
+    final canonicalQueryString = sortedKeys.map((k) => '${uriEncode(k)}=${uriEncode(queryParams[k]!)}').join('&');
+
+    // Canonical Request 规定，生成外链时 Payload 固定为 UNSIGNED-PAYLOAD
+    final canonicalRequest =[
+      'GET',
+      path,
+      canonicalQueryString,
+      'host:$host\n',
+      'host',
+      'UNSIGNED-PAYLOAD'
+    ].join('\n');
+
+    final stringToSign =[
+      'AWS4-HMAC-SHA256',
+      amzDate,
+      '$dateStamp/$region/$service/aws4_request',
+      sha256.convert(utf8.encode(canonicalRequest)).toString()
+    ].join('\n');
+
+    final kSecret = utf8.encode('AWS4$sk');
+    final kDate = Hmac(sha256, kSecret).convert(utf8.encode(dateStamp)).bytes;
+    final kRegion = Hmac(sha256, kDate).convert(utf8.encode(region)).bytes;
+    final kService = Hmac(sha256, kRegion).convert(utf8.encode(service)).bytes;
+    final kSigning = Hmac(sha256, kService).convert(utf8.encode('aws4_request')).bytes;
+    final signature = Hmac(sha256, kSigning).convert(utf8.encode(stringToSign)).toString();
+
+    // 拼接完整的外部下载直链
+    return '$endpoint$path?$canonicalQueryString&X-Amz-Signature=$signature';
   }
 }
