@@ -17,6 +17,9 @@ OSCA Viewer 是一个用于访问和管理 S3 兼容存储服务的桌面客户�
 - **进度显示**：显示上传/下载进度和传输速度
 - **任务取消**：支持取消正在进行的上传/下载任务
 - **UI生命周期管理**：修复了异步并发与UI生命周期不同步的bug，确保在大文件上传/下载完成前不会出现UI崩溃
+- **跨平台支持**：支持 Windows、macOS、Linux、Android 和 iOS 平台
+- **Linux桌面集成**：在Linux环境下提供原生桌面体验，包括桌面图标、应用菜单和文件管理器集成
+
 
 ## OSCA VFS 虚拟文件系统增强
 
@@ -62,7 +65,7 @@ flutter build apk --split-per-abi --release
 flutter build linux --release
 ```
 
-编译完成后，Release版本的可执行文件将生成在 `build/linux/x64/release/bundle/osca_viewer`，文件大小约为23.3KB。
+编译完成后，Release版本的可执行文件将生成在 `build/linux/x64/release/bundle/osca_viewer`。
 
 要运行该应用程序，请进入bundle目录并执行：
 ```bash
@@ -70,7 +73,34 @@ cd build/linux/x64/release/bundle
 ./osca_viewer
 ```
 
+## Linux桌面环境集成
+
+为了在Linux桌面环境中获得更好的体验，您可以使用提供的安装脚本来安装应用程序并配置桌面集成：
+
+```bash
+# 构建应用程序
+flutter build linux --release
+
+# 运行安装脚本（这将安装应用程序并配置桌面图标和菜单项）
+./linux/install.sh
+```
+
+安装完成后，您可以通过以下方式启动 OSCA Viewer：
+1. 在应用程序菜单中搜索 'OSCA Viewer'
+2. 在终端中运行 `osca_viewer` 命令
+
+## 卸载Linux版本
+
+如果需要卸载已安装的OSCA Viewer，可以使用提供的卸载脚本：
+
+```bash
+# 运行卸载脚本（这将删除应用程序和桌面集成）
+./linux/uninstall.sh
+```
+
 注意：运行Linux桌面应用程序需要系统安装相应的图形库依赖。
+
+
 7. 使用属性按钮查看和编辑文件属性
 
 ## 技术实现

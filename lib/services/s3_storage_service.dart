@@ -7,7 +7,19 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 's3_signer.dart';
 
-// ==================== [新增] 高级传输状态机 ====================
+// ====================[新增] 文件并发写入互斥锁 ====================
+class FileMutex {
+  Future<void>? _last;
+  Future<void> synchronized(Future<void> Function() action) async {
+    final previous = _last;
+    final completer = Completer<void>();
+    _last = completer.future;
+    if (previous != null) { await previous.catchError((_) {}); }
+    try { await action(); } finally { completer.complete(); }
+  }
+}
+
+// ==================== [增强] 高级传输状态机 ====================
 class PartInfo {
   final int partNumber;
   double progress;
@@ -28,8 +40,16 @@ class TransferTask extends ChangeNotifier {
   double overallProgress = 0.0;
   String overallSpeed = '等待中...';
   
-  // 保存每个并发分块的独立进度
   Map<int, PartInfo> parts = {};
+
+  // [核心修复1]: 限制前端渲染数量，防止卡顿。只显示正在跑的，和最新的 6 个已完成分片。
+  List<PartInfo> get visibleParts {
+    final active = parts.values.where((p) => p.progress < 1.0).toList();
+    final completed = parts.values.where((p) => p.progress >= 1.0).toList().reversed.take(6).toList();
+    final combined = [...active, ...completed];
+    combined.sort((a,b) => a.partNumber.compareTo(b.partNumber));
+    return combined;
+  }
 
   TransferTask(this.fileName, {this.isUpload = true});
 
@@ -43,15 +63,20 @@ class TransferTask extends ChangeNotifier {
     } else {
       parts[partNum]!.progress = p; parts[partNum]!.speed = s;
     }
-    notifyListeners(); // 通知 UI 局部刷新这个分块
+    notifyListeners(); 
   }
 
   void cancel() {
-    isCancelled = true; errorMessage = '用户已取消'; notifyListeners();
+    isCancelled = true; errorMessage = '用户取消'; notifyListeners();
   }
 
-  void complete() {
+  // 接收一个移除回调，实现完成后的自动销毁
+  void complete(Function(TransferTask)? onRemove) {
     isFinished = true; overallProgress = 1.0; overallSpeed = '已完成'; notifyListeners();
+    // [核心修复2]: 3秒后自动清除完成的任务
+    if (onRemove != null) {
+      Future.delayed(const Duration(seconds: 3), () => onRemove(this));
+    }
   }
 
   void error(String msg) {
@@ -59,13 +84,15 @@ class TransferTask extends ChangeNotifier {
   }
 }
 
-// 全局任务调度中心
 class TransferManager extends ChangeNotifier {
   List<TransferTask> tasks =[];
   
   void addTask(TransferTask task) {
-    tasks.insert(0, task); // 新任务置顶
-    notifyListeners();
+    tasks.insert(0, task); notifyListeners();
+  }
+  
+  void removeTask(TransferTask task) {
+    tasks.remove(task); notifyListeners();
   }
   
   int get activeCount => tasks.where((t) => !t.isFinished && !t.isError && !t.isCancelled).length;
@@ -88,14 +115,34 @@ class S3StorageService with ChangeNotifier {
   
   bool get isConfigured => _ak != null && _sk != null && _endpoint != null && _bucket != null && currentBucket != null;
 
-  // [新增]: 获取文件的外部直链
-  String getShareUrl(String key) {
+  // ==================== [新增] 获取外链（带时间配置） ====================
+  Future<String> getShareUrl(String key) async {
     if (!isConfigured) return '';
+    final prefs = await SharedPreferences.getInstance();
+    // 默认 86400 秒 (1天)，允许用户在设置中更改
+    final expiresIn = prefs.getInt('link_expire_seconds') ?? 86400; 
+
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
     return S3Signer.generatePresignedUrl(
-      endpoint: _endpoint!, host: host, path: path, ak: _ak!, sk: _sk!,
+      endpoint: _endpoint!, host: host, path: path, ak: _ak!, sk: _sk!, expiresIn: expiresIn
     );
+  }
+
+  // ==================== [新增] 获取云端已上传的碎片 (用于断点续传) ====================
+  Future<List<Map<String, dynamic>>> _listParts(String key, String uploadId) async {
+    final host = Uri.parse(_endpoint!).host;
+    final path = _encodePath(key);
+    final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, queryParams: {'uploadId': uploadId}, ak: _ak!, sk: _sk!);
+    final res = await http.get(Uri.parse('$_endpoint$path?uploadId=$uploadId'), headers: headers);
+    if (res.statusCode != 200) throw Exception("获取分片列表失败");
+
+    List<Map<String, dynamic>> parts =[];
+    final matches = RegExp(r'<Part>.*?<PartNumber>(\d+)</PartNumber>.*?<ETag>(.*?)</ETag>.*?</Part>', dotAll: true).allMatches(res.body);
+    for (final m in matches) {
+      parts.add({'PartNumber': int.parse(m.group(1)!), 'ETag': m.group(2)!});
+    }
+    return parts;
   }
 
   static const int _partSize = 5 * 1024 * 1024; // 5MB 分片界限
@@ -312,42 +359,80 @@ class S3StorageService with ChangeNotifier {
     return items;
   }
 
-  // ==================== 改造下载，支持取消和计算网速 ====================
-// ==================== [重构] 下载支持后台流控 ====================
-  Future<void> downloadFile(String key, String localPath, TransferTask task) async {
+  // ==================== [终极进化] 极速并发下载引擎 ====================
+  Future<void> downloadFile(String key, String localPath, int fileSize, TransferTask task) async {
     if (!isConfigured) return;
-    final cleanKey = _sanitizeKey(key);
-    final host = Uri.parse(_endpoint!).host;
-    final path = _encodePath(cleanKey);
     
-    final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, ak: _ak!, sk: _sk!);
-    final request = http.Request('GET', Uri.parse('$_endpoint$path'))..headers.addAll(headers);
-    final client = http.Client();
-    final response = await client.send(request);
-
-    if (response.statusCode != 200) throw Exception("下载失败: ${response.statusCode}");
-
     final file = File(localPath);
-    final sink = file.openWrite();
-    final totalSize = response.contentLength ?? 0;
-    int downloadedSize = 0;
-    final startTime = DateTime.now().millisecondsSinceEpoch;
+    // [核心技术]：预先撑开占位文件，以便多个线程在不同的 Offset 随意写入
+    final raf = await file.open(mode: FileMode.write);
+    await raf.truncate(fileSize); 
 
-    try {
-      await for (final chunk in response.stream) {
-        if (task.isCancelled) throw Exception("用户取消");
-        sink.add(chunk);
-        downloadedSize += chunk.length;
+    final host = Uri.parse(_endpoint!).host;
+    final path = _encodePath(_sanitizeKey(key));
+    
+    final mutex = FileMutex(); // 保证硬盘写入指针不出错
+    int activeDownloads = 0;
+    List<Future<void>> allTasks =[];
+    bool hasError = false;
+    String errorMsg = "";
+    int downloadedBytes = 0;
+    final startT = DateTime.now().millisecondsSinceEpoch;
+
+    // 分片下载核心函数
+    Future<void> downloadPart(int start, int end, int pNum) async {
+      final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, extraHeaders: {'Range': 'bytes=$start-$end'}, ak: _ak!, sk: _sk!);
+      final req = http.Request('GET', Uri.parse('$_endpoint$path'))..headers.addAll(headers);
+      final client = http.Client();
+      try {
+        final res = await client.send(req);
+        if (res.statusCode != 206 && res.statusCode != 200) throw Exception("HTTP ${res.statusCode}");
         
-        final elapsedSecs = (DateTime.now().millisecondsSinceEpoch - startTime) / 1000.0;
-        final speed = elapsedSecs > 0 ? '${formatSize(downloadedSize / elapsedSecs)}/s' : '...';
-        if (totalSize > 0) task.updateOverall(downloadedSize / totalSize.toDouble(), speed);
+        // 1. 将 5MB 分片下载到内存中
+        final builder = BytesBuilder();
+        await for (final chunk in res.stream) {
+          if (task.isCancelled) throw Exception("取消");
+          builder.add(chunk);
+          downloadedBytes += chunk.length;
+          
+          final el = (DateTime.now().millisecondsSinceEpoch - startT) / 1000.0;
+          task.updateOverall(downloadedBytes / fileSize.toDouble(), el > 0 ? '${formatSize(downloadedBytes / el)}/s' : '...');
+          task.updatePart(pNum, builder.length / (end - start + 1), '下载中');
+        }
+        
+        // 2. 利用互斥锁安全写入硬盘对应位置
+        final fullBytes = builder.takeBytes();
+        await mutex.synchronized(() async {
+          await raf.setPosition(start);
+          await raf.writeFrom(fullBytes);
+        });
+        task.updatePart(pNum, 1.0, '完成');
+      } finally {
+        client.close();
       }
-    } finally {
-      await sink.close();
-      client.close();
-      if (task.isCancelled && file.existsSync()) file.deleteSync();
     }
+
+    // 滑动窗口并发切割下载
+    for (int i = 0; i < fileSize; i += _partSize) {
+      if (task.isCancelled || hasError) break;
+      while (activeDownloads >= 4 && !hasError && !task.isCancelled) await Future.delayed(const Duration(milliseconds: 10));
+      if (task.isCancelled || hasError) break;
+
+      activeDownloads++;
+      int end = (i + _partSize - 1 < fileSize) ? i + _partSize - 1 : fileSize - 1;
+      int pNum = (i / _partSize).floor() + 1;
+
+      allTasks.add(downloadPart(i, end, pNum).then((_) => activeDownloads--).catchError((e) {
+        hasError = true; errorMsg = e.toString(); activeDownloads--;
+        return 0;
+      }));
+    }
+
+    await Future.wait(allTasks);
+    await raf.close(); // 关闭流
+
+    if (task.isCancelled) { file.deleteSync(); throw Exception("用户取消"); }
+    if (hasError) { file.deleteSync(); throw Exception(errorMsg); }
   }
 
   Future<void> uploadFile(String localPath, String remoteKey, TransferTask task) async {
@@ -359,7 +444,7 @@ class S3StorageService with ChangeNotifier {
     if (fileSize <= _partSize) {
       final bytes = await file.readAsBytes();
       await _uploadSingleFile(cleanKey, bytes);
-      task.complete();
+      task.complete(null);
     } else {
       await _uploadMultipartFile(file, cleanKey, fileSize, task);
     }
@@ -438,7 +523,7 @@ class S3StorageService with ChangeNotifier {
       allTasks.add(
         _sendPart(Uint8List.fromList(currentChunk), partNumber, uploadId, path, host, uploadedParts, task, onBytesSent)
         .then((_) => activeUploads--)
-        .catchError((e) { hasError = true; errorMsg = e.toString(); activeUploads--; })
+        .catchError((e) { hasError = true; errorMsg = e.toString(); activeUploads--; return 0; })
       );
     }
 

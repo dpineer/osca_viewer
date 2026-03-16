@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="512"
+   height="512"
+   viewBox="0 0 512 512"
+   version="1.1"
+   id="svg8"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <rect
+     style="fill:#42a5f5;fill-opacity:1;stroke:none;stroke-width:0;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1"
+     id="rect846"
+     width="512"
+     height="512"
+     x="0"
+     y="0"
+     ry="85.333336" />
+  <path
+     d="M 128,128 H 384 V 384 H 128 Z"
+     fill="#ffffff"
+     id="path2"
+     style="fill:#ffffff;fill-opacity:1;stroke-width:1.33333" />
+  <path
+     d="m 192,192 h 128 v 128 H 192 Z"
+     fill="#42a5f5"
+     id="path4"
+     style="fill:#ffffff;fill-opacity:1;stroke-width:1.33333" />
+  <text
+     xml:space="preserve"
+     style="font-style:normal;font-weight:normal;font-size:42.6667px;line-height:1.25;font-family:sans-serif;fill:#000000;fill-opacity:1;stroke:none"
+     x="224"
+     y="277.33334"
+     id="text850"><tspan
+       id="tspan848"
+       x="224"
+       y="277.33334"
+       style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:42.6667px;font-family:sans-serif;-inkscape-font-specification:'sans-serif Bold';fill:#42a5f5;fill-opacity:1">OSCA</tspan></text>
+</svg>

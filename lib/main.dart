@@ -90,6 +90,7 @@ class _ConfigPageState extends State<ConfigPage> {
   final TextEditingController _endpointController = TextEditingController();
   final TextEditingController _bucketController = TextEditingController();
   bool _isLoading = false;
+  int _linkExpireSeconds = 86400; // 默认一天
 
   @override
   void initState() {
@@ -106,6 +107,7 @@ class _ConfigPageState extends State<ConfigPage> {
         _skController.text = prefs.getString('sk') ?? '';
         _endpointController.text = prefs.getString('endpoint') ?? '';
         _bucketController.text = prefs.getString('bucket') ?? '';
+        _linkExpireSeconds = prefs.getInt('link_expire_seconds') ?? 86400;
       });
     }
   }
@@ -177,6 +179,23 @@ class _ConfigPageState extends State<ConfigPage> {
             ),
             Divider(height: 40),
             
+            // [新增]：外链有效期配置
+            ListTile(
+              title: Text('分享外链有效期'),
+              subtitle: Text('影响通过APP复制出的分享直链存活时间'),
+              trailing: DropdownButton<int>(
+                value: _linkExpireSeconds,
+                items:[
+                  DropdownMenuItem(value: 3600, child: Text('1 小时')),
+                  DropdownMenuItem(value: 86400, child: Text('1 天')),
+                  DropdownMenuItem(value: 604800, child: Text('7 天')),
+                ],
+                onChanged: (val) {
+                  if (val != null) setState(() => _linkExpireSeconds = val);
+                },
+              ),
+            ),
+            
             // [更新]：修改为 Native S3 目录机制说明
             ListTile(
               leading: Icon(Icons.info_outline, color: Colors.blue),
@@ -209,6 +228,9 @@ class _ConfigPageState extends State<ConfigPage> {
         _akController.text, _skController.text,
         _endpointController.text, _bucketController.text,
       );
+      
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('link_expire_seconds', _linkExpireSeconds);
       
       // 如果是从文件列表的"设置"图标 push 进来的，认证成功后要 pop 退出
       if (mounted && Navigator.canPop(context)) {
@@ -414,11 +436,12 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     String localPath = p.join(localDir, item['name']);
     final task = TransferTask(item['name'], isUpload: false);
     context.read<TransferManager>().addTask(task);
-    _showMsg("已加入下载队列，请点击右上角查看进度");
+    _showMsg("已加入并发下载队列");
 
     try {
-      await context.read<S3StorageService>().downloadFile(item['key'], localPath, task);
-      if (!task.isCancelled) task.complete();
+      // 传入 fileSize 以启动分块加速引擎
+      await context.read<S3StorageService>().downloadFile(item['key'], localPath, item['size'], task);
+      if (!task.isCancelled) task.complete((t) => context.read<TransferManager>().removeTask(t));
     } catch (e) {
       if (!task.isCancelled) task.error(e.toString());
     }
@@ -438,75 +461,12 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     try {
       await context.read<S3StorageService>().uploadFile(localPath, "$_currentPrefix$fileName", task);
       if (!task.isCancelled) {
-        task.complete();
+        task.complete((t) => context.read<TransferManager>().removeTask(t));
         _loadFiles(); // 成功后刷新列表
       }
     } catch (e) {
       if (!task.isCancelled) task.error(e.toString());
     }
-  }
-
-  // [核心修复]: 重新设计的长任务进度弹窗
-  void _showProgressDialog(String title, String fileName, TransferTask task, Future<void> Function(Function(double, String)) runTask) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        double currentProgress = 0;
-        String currentSpeed = "初始化连接...";
-        bool taskStarted = false;
-
-        return StatefulBuilder(
-          builder: (innerContext, setDialogState) {
-            
-            // 更新进度条方法
-            void updateProgress(double p, String speed) {
-              // 修复点 1：检查的是弹窗内部的 context，而不是外层页面的 context
-              if (!innerContext.mounted) return; 
-              setDialogState(() { 
-                currentProgress = p; 
-                currentSpeed = speed; 
-              });
-              // 移除了这里原有的 p >= 1.0 就自动 pop 的危险逻辑
-            }
-            
-            // 只在弹窗第一次构建时启动任务
-            if (!taskStarted) {
-              taskStarted = true;
-              // 修复点 2：监听整个异步任务，无论成功、失败还是取消，都在彻底执行完毕后自动关闭弹窗
-              runTask(updateProgress).whenComplete(() {
-                if (innerContext.mounted && Navigator.canPop(dialogContext)) {
-                  Navigator.pop(dialogContext);
-                }
-              });
-            }
-
-            return AlertDialog(
-              title: Text(title),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                children:[
-                  LinearProgressIndicator(value: currentProgress),
-                  SizedBox(height: 10),
-                  Text("${(currentProgress * 100).toStringAsFixed(1)}%   -   $currentSpeed", style: TextStyle(fontWeight: FontWeight.bold)),
-                  SizedBox(height: 5),
-                  Text(fileName, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: Colors.grey)),
-                ],
-              ),
-              actions:[
-                TextButton(
-                  onPressed: () {
-                    task.cancel(); // 触发中止令牌
-                    // 点击取消后不需要手动 pop，因为 task 抛出异常会触发上方的 whenComplete 自动关闭
-                  },
-                  child: Text('取消任务', style: TextStyle(color: Colors.red)),
-                )
-              ],
-            );
-          },
-        );
-      },
-    );
   }
 
   void _showMsg(String msg, {bool isError = false}) {
@@ -623,7 +583,8 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                                     SizedBox(height: 6),
                                     Wrap(
                                       spacing: 8, runSpacing: 8,
-                                      children: t.parts.values.map((p) => 
+                                      // [修复卡顿]: 仅渲染 visibleParts
+                                      children: t.visibleParts.map((p) => 
                                         Container(
                                           width: 80, padding: EdgeInsets.all(6),
                                           decoration: BoxDecoration(color: Colors.grey.withOpacity(0.1), borderRadius: BorderRadius.circular(6)),
@@ -748,10 +709,10 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                           IconButton(
                             icon: Icon(Icons.share, color: Colors.purple),
                             tooltip: '复制外链',
-                            onPressed: () {
-                              final url = context.read<S3StorageService>().getShareUrl(item['key']);
+                            onPressed: () async {
+                              final url = await context.read<S3StorageService>().getShareUrl(item['key']);
                               Clipboard.setData(ClipboardData(text: url));
-                              _showMsg("外链已复制到剪贴板，24小时内有效");
+                              _showMsg("专属外链已复制，有效期请见设置面板");
                             },
                           ),
 

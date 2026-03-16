@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=OSCA Viewer
+Comment=A desktop client for accessing and managing S3 compatible storage services
+Exec=osca_viewer
+Icon=osca_viewer
+Type=Application
+Categories=Network;FileTransfer;FileManager;
+MimeType=application/octet-stream;
+Terminal=false
+StartupNotify=true
