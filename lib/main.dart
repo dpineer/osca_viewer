@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
+import 'package:intl/intl.dart';
 import 'services/s3_storage_service.dart';
 
 
@@ -196,13 +197,21 @@ class _ConfigPageState extends State<ConfigPage> {
               ),
             ),
             
+            // [新增]：分享管理按钮
+            ListTile(
+              leading: Icon(Icons.link, color: Colors.green),
+              title: Text('分享链接管理'),
+              subtitle: Text('查看和管理已生成的分享外链'),
+              trailing: Icon(Icons.arrow_forward_ios),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ShareManagerPage())),
+            ),
+            
             // [更新]：修改为 Native S3 目录机制说明
             ListTile(
               leading: Icon(Icons.info_outline, color: Colors.blue),
               title: Text('标准 S3 目录架构', style: TextStyle(fontWeight: FontWeight.bold)),
               subtitle: Text(
-                '已接入 OSCA 官方规范：通过创建以 "/" 结尾的 0 字节对象来实现原生目录管理。'
-                '\n✓ 优点：底层直接采用 PutObject 接口，完美兼容各平台 S3 客户端，再也无需担心跨客户端时出现"幽灵文件"与配置不同步的问题。',
+                '已接入 OSCA 官方规范：通过创建以 "/" 结尾的 0 字节对象来实现原生目录管理。',
                 style: TextStyle(fontSize: 12),
               ),
             ),
@@ -669,7 +678,14 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
             ),
           ),
           
-          // 5. 设置页入口
+          // 5. 外链管理入口
+          IconButton(
+            icon: Icon(Icons.insert_link), // 链条图标
+            tooltip: '外链管理',
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ShareManagerPage())),
+          ),
+          
+          // 6. 设置页入口
           IconButton(
             icon: Icon(Icons.settings),
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ConfigPage())),
@@ -708,11 +724,11 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                         if (!item['isDir'])
                           IconButton(
                             icon: Icon(Icons.share, color: Colors.purple),
-                            tooltip: '复制外链',
+                            tooltip: '分享外链',
                             onPressed: () async {
-                              final url = await context.read<S3StorageService>().getShareUrl(item['key']);
+                              final url = await context.read<S3StorageService>().generateAndSaveShareUrl(item['key'], item['name']);
                               Clipboard.setData(ClipboardData(text: url));
-                              _showMsg("专属外链已复制，有效期请见设置面板");
+                              _showMsg("专属外链已复制！您可在外链管理中查看");
                             },
                           ),
 
@@ -807,3 +823,136 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     );
   }
 }
+
+// ==================== [优化重构] 外链管理中心 ====================
+class ShareManagerPage extends StatefulWidget {
+  @override
+  _ShareManagerPageState createState() => _ShareManagerPageState();
+}
+
+class _ShareManagerPageState extends State<ShareManagerPage> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<S3StorageService>().loadShareHistory();
+    });
+  }
+
+  void _clearExpiredLinks() async {
+    final s3 = context.read<S3StorageService>();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final expiredIndexes = <int>[];
+    
+    for (int i = 0; i < s3.shareHistory.length; i++) {
+      if (s3.shareHistory[i]['expireAt'] < now) expiredIndexes.add(i);
+    }
+    
+    // 从后往前删，避免索引错乱
+    for (int i = expiredIndexes.length - 1; i >= 0; i--) {
+      await s3.deleteShareRecord(expiredIndexes[i]);
+    }
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已清理 ${expiredIndexes.length} 个过期链接')));
+  }
+
+  // 计算剩余相对时间
+  String _getRemainingTime(int expireAt) {
+    final diff = DateTime.fromMillisecondsSinceEpoch(expireAt).difference(DateTime.now());
+    if (diff.isNegative) return "已过期";
+    if (diff.inDays > 0) return "剩 ${diff.inDays} 天 ${diff.inHours % 24} 小时";
+    if (diff.inHours > 0) return "剩 ${diff.inHours} 小时 ${diff.inMinutes % 60} 分钟";
+    return "剩 ${diff.inMinutes} 分钟";
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('外链管理中心'),
+        actions:[
+          IconButton(
+            icon: Icon(Icons.cleaning_services),
+            tooltip: '清理过期链接',
+            onPressed: _clearExpiredLinks,
+          )
+        ],
+      ),
+      body: Consumer<S3StorageService>(
+        builder: (context, s3, child) {
+          if (s3.shareHistory.isEmpty) {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children:[
+                  Icon(Icons.link_off, size: 64, color: Colors.grey.withOpacity(0.5)),
+                  SizedBox(height: 16),
+                  Text("暂无分享链接", style: TextStyle(color: Colors.grey)),
+                  Text("在文件列表中点击分享按钮即可生成", style: TextStyle(fontSize: 12, color: Colors.grey)),
+                ],
+              )
+            );
+          }
+          return ListView.builder(
+            itemCount: s3.shareHistory.length,
+            itemBuilder: (context, index) {
+              final item = s3.shareHistory[index];
+              final expireDate = DateTime.fromMillisecondsSinceEpoch(item['expireAt']);
+              final timeStr = DateFormat('yyyy-MM-dd HH:mm').format(expireDate);
+              final isExpired = DateTime.now().millisecondsSinceEpoch > item['expireAt'];
+
+              return Card(
+                elevation: isExpired ? 0 : 2,
+                color: isExpired ? Theme.of(context).cardColor.withOpacity(0.5) : null,
+                margin: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: ListTile(
+                  leading: CircleAvatar(
+                    backgroundColor: isExpired ? Colors.grey.withOpacity(0.2) : Colors.purple.withOpacity(0.1),
+                    child: Icon(Icons.link, color: isExpired ? Colors.grey : Colors.purple),
+                  ),
+                  title: Text(
+                    item['fileName'], 
+                    maxLines: 1, 
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(decoration: isExpired ? TextDecoration.lineThrough : null),
+                  ),
+                  subtitle: Padding(
+                    padding: const EdgeInsets.only(top: 4.0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children:[
+                        Text('到期: $timeStr', style: TextStyle(fontSize: 12)),
+                        Text(
+                          _getRemainingTime(item['expireAt']),
+                          style: TextStyle(color: isExpired ? Colors.red : Colors.green, fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children:[
+                      if (!isExpired)
+                        IconButton(
+                          icon: Icon(Icons.copy, color: Colors.blue),
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(text: item['url']));
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已复制外链')));
+                          },
+                        ),
+                      IconButton(
+                        icon: Icon(Icons.delete_outline, color: Colors.red),
+                        onPressed: () => s3.deleteShareRecord(index),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+

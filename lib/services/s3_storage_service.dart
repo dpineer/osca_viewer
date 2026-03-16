@@ -115,15 +115,57 @@ class S3StorageService with ChangeNotifier {
   
   bool get isConfigured => _ak != null && _sk != null && _endpoint != null && _bucket != null && currentBucket != null;
 
-  // ==================== [新增] 获取外链（带时间配置） ====================
-  Future<String> getShareUrl(String key) async {
+  // ==================== [新增] 外链管理中心状态 ====================
+  List<Map<String, dynamic>> _shareHistory =[];
+  List<Map<String, dynamic>> get shareHistory => _shareHistory;
+
+  Future<void> loadShareHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final historyStr = prefs.getString('share_history') ?? '[]';
+    List<dynamic> list = jsonDecode(historyStr);
+    _shareHistory = list.cast<Map<String, dynamic>>();
+    
+    // 自动清理已经过期的链接
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _shareHistory.removeWhere((item) => item['expireAt'] < now);
+    await prefs.setString('share_history', jsonEncode(_shareHistory));
+    notifyListeners();
+  }
+
+  Future<String> generateAndSaveShareUrl(String key, String fileName) async {
+    final url = await getShareUrl(key, fileName);
+    final prefs = await SharedPreferences.getInstance();
+    final expiresIn = prefs.getInt('link_expire_seconds') ?? 86400;
+    final expireAt = DateTime.now().millisecondsSinceEpoch + (expiresIn * 1000);
+
+    _shareHistory.insert(0, {
+      'fileName': fileName,
+      'key': key,
+      'url': url,
+      'expireAt': expireAt,
+      'createdAt': DateTime.now().millisecondsSinceEpoch,
+    });
+    await prefs.setString('share_history', jsonEncode(_shareHistory));
+    notifyListeners();
+    return url;
+  }
+
+  Future<void> deleteShareRecord(int index) async {
+    _shareHistory.removeAt(index);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('share_history', jsonEncode(_shareHistory));
+    notifyListeners();
+  }
+
+  // ==================== [修正] 获取外链（带时间配置） ====================
+  Future<String> getShareUrl(String key, String fileName) async {
     if (!isConfigured) return '';
     final prefs = await SharedPreferences.getInstance();
-    // 默认 86400 秒 (1天)，允许用户在设置中更改
     final expiresIn = prefs.getInt('link_expire_seconds') ?? 86400; 
 
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
+    // 只生成链接并返回，不再在此处向 SharedPreferences 写数据，避免与 generateAndSaveShareUrl 冲突
     return S3Signer.generatePresignedUrl(
       endpoint: _endpoint!, host: host, path: path, ak: _ak!, sk: _sk!, expiresIn: expiresIn
     );
@@ -381,7 +423,7 @@ class S3StorageService with ChangeNotifier {
 
     // 分片下载核心函数
     Future<void> downloadPart(int start, int end, int pNum) async {
-      final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, extraHeaders: {'Range': 'bytes=$start-$end'}, ak: _ak!, sk: _sk!);
+      final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, extraHeaders: {'Range': 'bytes=$start-$end', 'Connection': 'close'}, ak: _ak!, sk: _sk!);
       final req = http.Request('GET', Uri.parse('$_endpoint$path'))..headers.addAll(headers);
       final client = http.Client();
       try {
@@ -415,14 +457,16 @@ class S3StorageService with ChangeNotifier {
     // 滑动窗口并发切割下载
     for (int i = 0; i < fileSize; i += _partSize) {
       if (task.isCancelled || hasError) break;
-      while (activeDownloads >= 4 && !hasError && !task.isCancelled) await Future.delayed(const Duration(milliseconds: 10));
+      while (activeDownloads >= 4 && !hasError && !task.isCancelled) {
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
       if (task.isCancelled || hasError) break;
 
       activeDownloads++;
       int end = (i + _partSize - 1 < fileSize) ? i + _partSize - 1 : fileSize - 1;
       int pNum = (i / _partSize).floor() + 1;
 
-      allTasks.add(downloadPart(i, end, pNum).then((_) => activeDownloads--).catchError((e) {
+        allTasks.add(downloadPart(i, end, pNum).then((_) => activeDownloads--).catchError((e) {
         hasError = true; errorMsg = e.toString(); activeDownloads--;
         return 0;
       }));
@@ -451,26 +495,24 @@ class S3StorageService with ChangeNotifier {
   }
 
   /// [核心新增] OSCA > 100M 多分片上传支持
-  // ====================[终极优化] 并发分片加速上传引擎 ====================
-  // ==================== [重构] 多并发分片引擎带微观字节监控 ====================
-  // ==================== [终极进化] 真实网络背压与滑动窗口并发引擎 ====================
+  // ====================[终极安全版] 彻底根除暗箱头与签名 403 陷阱 ====================
   Future<void> _uploadMultipartFile(File file, String key, int fileSize, TransferTask task) async {
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
 
     final initHeaders = S3Signer.generateV4Headers(method: 'POST', host: host, path: path, queryParams: {'uploads': ''}, ak: _ak!, sk: _sk!);
     final initRes = await http.post(Uri.parse('$_endpoint$path?uploads='), headers: initHeaders);
-    if (initRes.statusCode != 200) throw Exception("初始化分片失败");
-    final uploadId = RegExp(r'<UploadId>(.*?)</UploadId>').firstMatch(initRes.body)!.group(1)!;
+    if (initRes.statusCode != 200) throw Exception("初始化分片失败: ${initRes.body}");
+    
+    // 兼容部分 S3 服务端返回标签大小写不一致的问题
+    final match = RegExp(r'<[Uu]ploadId>(.*?)</[Uu]ploadId>').firstMatch(initRes.body);
+    if (match == null) throw Exception("无法获取 UploadId");
+    final uploadId = match.group(1)!;
 
     List<Map<String, dynamic>> uploadedParts =[];
     int totalUploadedBytes = 0;
-    int partNumber = 1;
-    List<int> currentChunk =[];
-    
     final overallStartTime = DateTime.now().millisecondsSinceEpoch;
 
-    // 每次流向真实网卡写入数据时更新总进度
     void onBytesSent(int bytesCount) {
       totalUploadedBytes += bytesCount;
       final elapsedSecs = (DateTime.now().millisecondsSinceEpoch - overallStartTime) / 1000.0;
@@ -478,69 +520,53 @@ class S3StorageService with ChangeNotifier {
       task.updateOverall(totalUploadedBytes / fileSize.toDouble(), speed);
     }
 
-    // [核心改进]：滑动窗口控制器
     int activeUploads = 0;
     List<Future<void>> allTasks =[];
     bool hasError = false;
     String errorMsg = "";
 
-    await for (final chunk in file.openRead()) {
-      if (task.isCancelled) throw Exception("用户取消");
-      if (hasError) throw Exception(errorMsg);
-      
-      currentChunk.addAll(chunk);
-      
-      while (currentChunk.length >= _partSize) {
-        final chunkBytes = Uint8List.fromList(currentChunk.sublist(0, _partSize));
-        currentChunk = currentChunk.sublist(_partSize);
-        
-        // 滑动窗口检查：如果满4个车道，就微秒级挂起，一旦空出车道立刻无缝补上！
+    // 内存控制：死死压住最多只有 4x5MB = 20MB 在内存中
+    final raf = await file.open(mode: FileMode.read);
+    int partNumber = 1;
+
+    try {
+      while (true) {
+        if (task.isCancelled || hasError) break;
+
         while (activeUploads >= 4 && !hasError && !task.isCancelled) {
           await Future.delayed(const Duration(milliseconds: 10));
         }
         if (task.isCancelled || hasError) break;
 
+        final chunkBytes = await raf.read(_partSize);
+        if (chunkBytes.isEmpty) break; // 读取完毕
+
         activeUploads++;
         final pNum = partNumber++;
-        
-        // 抛入后台独立运行，不阻塞文件读取
-        final future = _sendPart(chunkBytes, pNum, uploadId, path, host, uploadedParts, task, onBytesSent).then((_) {
-          activeUploads--; // 上传完毕，空出车道
-        }).catchError((e) {
-          hasError = true; errorMsg = e.toString(); activeUploads--;
-        });
-        
+
+        final future = _sendPart(chunkBytes, pNum, uploadId, path, host, uploadedParts, task, onBytesSent)
+            .then((_) => activeUploads--)
+            .catchError((e) {
+               hasError = true; errorMsg = e.toString(); activeUploads--;
+            });
+
         allTasks.add(future);
       }
-    }
-    
-    // 扫尾最后一个不规则的碎片
-    if (currentChunk.isNotEmpty && !hasError && !task.isCancelled) {
-      while (activeUploads >= 4 && !hasError && !task.isCancelled) {
-        await Future.delayed(const Duration(milliseconds: 10));
-      }
-      activeUploads++;
-      allTasks.add(
-        _sendPart(Uint8List.fromList(currentChunk), partNumber, uploadId, path, host, uploadedParts, task, onBytesSent)
-        .then((_) => activeUploads--)
-        .catchError((e) { hasError = true; errorMsg = e.toString(); activeUploads--; return 0; })
-      );
+      await Future.wait(allTasks);
+    } finally {
+      await raf.close();
     }
 
-    // 严谨等待所有车道的收尾工作
-    await Future.wait(allTasks);
-    
     if (task.isCancelled) throw Exception("用户取消");
     if (hasError) throw Exception(errorMsg);
 
-    // 必须按 PartNumber 正确排序合并
     uploadedParts.sort((a, b) => (a['PartNumber'] as int).compareTo(b['PartNumber'] as int));
     final completeXml = _buildCompleteXml(uploadedParts);
     final completeBytes = utf8.encode(completeXml);
     
     final completeHeaders = S3Signer.generateV4Headers(method: 'POST', host: host, path: path, queryParams: {'uploadId': uploadId}, ak: _ak!, sk: _sk!, payloadBytes: completeBytes);
     final completeRes = await http.post(Uri.parse('$_endpoint$path?uploadId=$uploadId'), headers: completeHeaders, body: completeBytes);
-    if (completeRes.statusCode != 200) throw Exception("合并分片失败");
+    if (completeRes.statusCode != 200) throw Exception("合并分片失败: ${completeRes.body}");
   }
 
   String _buildCompleteXml(List<Map<String, dynamic>> parts) {
@@ -576,56 +602,104 @@ class S3StorageService with ChangeNotifier {
     }
   }
 
-  // ==================== [核心改进] 真实物理网卡级传输监控 ====================
   Future<void> _sendPart(Uint8List chunkBytes, int pNum, String uploadId, String path, String host, List<Map<String, dynamic>> uploadedParts, TransferTask task, Function(int) onBytesSent) async {
+    const int maxRetries = 3;
+    final safeUploadId = S3Signer.uriEncode(uploadId);
     final queryParams = {'partNumber': pNum.toString(), 'uploadId': uploadId};
-    final headers = S3Signer.generateV4Headers(method: 'PUT', host: host, path: path, queryParams: queryParams, ak: _ak!, sk: _sk!, payloadBytes: chunkBytes);
-    final url = '$_endpoint$path?partNumber=$pNum&uploadId=$uploadId';
-    
-    final request = http.StreamedRequest('PUT', Uri.parse(url));
-    request.headers.addAll(headers);
-    request.contentLength = chunkBytes.length;
-    
-    int sentBytes = 0;
-    final startT = DateTime.now().millisecondsSinceEpoch;
-    
-    // 创建一个受 Dart HTTP 客户端物理限制的流
-    Stream<List<int>> streamData() async* {
-      const chunkSize = 64 * 1024; // 每次交给系统 64KB
-      for (int i = 0; i < chunkBytes.length; i += chunkSize) {
-        if (task.isCancelled) throw Exception("用户取消");
-        int end = (i + chunkSize < chunkBytes.length) ? i + chunkSize : chunkBytes.length;
-        final piece = chunkBytes.sublist(i, end);
-        
-        sentBytes += piece.length;
-        onBytesSent(piece.length); // 推送给总进度
-        
-        double elapsed = (DateTime.now().millisecondsSinceEpoch - startT) / 1000.0;
-        task.updatePart(pNum, sentBytes / chunkBytes.length, elapsed > 0 ? '${formatSize(sentBytes / elapsed)}/s' : '...');
-        
-        yield piece; // [关键点]: 只有当网络真的发出去后，框架才会索求下一次 yield！
-      }
-    }
 
-    // 绑定物理流并监听异常
-    request.sink.addStream(streamData()).then((_) {
-      request.sink.close();
-    }).catchError((e) {
-      request.sink.addError(e); request.sink.close();
-    });
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      if (task.isCancelled) return;
+      int sentBytesThisAttempt = 0;
+      final client = http.Client();
 
-    final client = http.Client();
-    try {
-      final response = await client.send(request);
-      if (response.statusCode != 200) throw Exception("Part $pNum Failed: ${response.statusCode}");
-      
-      final etag = response.headers['etag'] ?? response.headers['ETag'];
-      if (etag != null) {
+      try {
+        task.updatePart(pNum, 0.0, attempt > 1 ? '重试($attempt/3)' : '发送中...');
+
+        final extraHeaders = {
+          'Content-Type': 'application/octet-stream',
+        };
+
+        final headers = S3Signer.generateV4Headers(
+          method: 'PUT', 
+          host: host, 
+          path: path, 
+          queryParams: queryParams,
+          extraHeaders: extraHeaders,
+          ak: _ak!, 
+          sk: _sk!, 
+          payloadBytes: chunkBytes
+        );
+
+        final url = Uri.parse('$_endpoint$path?partNumber=$pNum&uploadId=$safeUploadId');
+        final request = http.StreamedRequest('PUT', url);
+        request.headers.addAll(headers);
+        request.contentLength = chunkBytes.length;
+
+        final startT = DateTime.now().millisecondsSinceEpoch;
+
+        // 使用 async* 配合较小的 chunk 实现流式进度更新，依靠底层机制控制速率
+        Stream<List<int>> streamData() async* {
+          const chunkSize = 128 * 1024;
+          for (int i = 0; i < chunkBytes.length; i += chunkSize) {
+            if (task.isCancelled) throw Exception("任务取消");
+            int end = (i + chunkSize < chunkBytes.length) ? i + chunkSize : chunkBytes.length;
+            final piece = chunkBytes.sublist(i, end);
+            
+            yield piece;
+            
+            sentBytesThisAttempt += piece.length;
+            onBytesSent(piece.length); 
+            
+            double elapsed = (DateTime.now().millisecondsSinceEpoch - startT) / 1000.0;
+            task.updatePart(pNum, sentBytesThisAttempt / chunkBytes.length, elapsed > 0 ? '${formatSize(sentBytesThisAttempt / elapsed)}/s' : '...');
+          }
+        }
+
+        final responseFuture = client.send(request);
+        
+        await request.sink.addStream(streamData());
+        request.sink.close();
+
+        final streamedResponse = await responseFuture.timeout(const Duration(minutes: 5));
+        final response = await http.Response.fromStream(streamedResponse);
+
+        if (response.statusCode != 200) {
+          String errMsg = response.body;
+          final match = RegExp(r'<Code>(.*?)</Code>').firstMatch(errMsg);
+          if (match != null) errMsg = match.group(1)!;
+          throw Exception("${response.statusCode} - $errMsg");
+        }
+
+        String? etag = response.headers['etag'] ?? response.headers['ETag'];
+        if (etag == null || etag.isEmpty) {
+          final match = RegExp(r'<ETag>(.*?)</ETag>', caseSensitive: false).firstMatch(response.body);
+          etag = match?.group(1);
+        }
+        if (etag == null || etag.isEmpty) throw Exception("缺失 ETag");
+        etag = etag.replaceAll('"', '');
+
         uploadedParts.add({'PartNumber': pNum, 'ETag': etag});
+        task.updatePart(pNum, 1.0, '完成');
+        return;
+
+      } catch (e) {
+        onBytesSent(-sentBytesThisAttempt);
+        
+        if (task.isCancelled) return;
+        
+        String uiErrorText = e.toString().replaceAll('Exception: ', '');
+        if (uiErrorText.length > 15) uiErrorText = uiErrorText.substring(0, 15) + '...';
+        
+        if (attempt == maxRetries) {
+          task.updatePart(pNum, 0.0, '失败');
+          throw Exception("分片 $pNum 异常: $e");
+        }
+        
+        task.updatePart(pNum, 0.0, uiErrorText);
+        await Future.delayed(Duration(seconds: attempt * 2));
+      } finally {
+        client.close();
       }
-      task.updatePart(pNum, 1.0, '完成');
-    } finally {
-      client.close(); // 释放连接
     }
   }
 
