@@ -171,23 +171,67 @@ class S3StorageService with ChangeNotifier {
     );
   }
 
-  // ==================== [新增] 获取云端已上传的碎片 (用于断点续传) ====================
+  // ==================== [修复] 获取云端分片 (修复严格模式 S3 签名屏蔽问题) ====================
   Future<List<Map<String, dynamic>>> _listParts(String key, String uploadId) async {
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
-    final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, queryParams: {'uploadId': uploadId}, ak: _ak!, sk: _sk!);
-    final res = await http.get(Uri.parse('$_endpoint$path?uploadId=$uploadId'), headers: headers);
-    if (res.statusCode != 200) throw Exception("获取分片列表失败");
+    List<Map<String, dynamic>> allParts =[];
+    
+    bool isTruncated = true;
+    String? partNumberMarker;
 
-    List<Map<String, dynamic>> parts =[];
-    final matches = RegExp(r'<Part>.*?<PartNumber>(\d+)</PartNumber>.*?<ETag>(.*?)</ETag>.*?</Part>', dotAll: true).allMatches(res.body);
-    for (final m in matches) {
-      parts.add({'PartNumber': int.parse(m.group(1)!), 'ETag': m.group(2)!});
+    while (isTruncated) {
+      final queryParams = {'uploadId': uploadId};
+      if (partNumberMarker != null) {
+        queryParams['part-number-marker'] = partNumberMarker;
+      }
+
+      final headers = S3Signer.generateV4Headers(
+        method: 'GET', 
+        host: host, 
+        path: path, 
+        queryParams: queryParams, 
+        ak: _ak!, 
+        sk: _sk!
+      );
+      
+      // [核心修复]：必须对 Query Params 进行字典排序后拼接 URL，否则严格厂商将直接抛出 403 阻断分页！
+      final sortedKeys = queryParams.keys.toList()..sort();
+      final queryParts = sortedKeys.map((k) => '${S3Signer.uriEncode(k)}=${S3Signer.uriEncode(queryParams[k]!)}').join('&');
+      
+      final res = await http.get(Uri.parse('$_endpoint$path?$queryParts'), headers: headers);
+      
+      if (res.statusCode != 200) throw Exception("获取云端分片列表失败: ${res.statusCode}");
+
+      final matches = RegExp(r'<Part>.*?<PartNumber>(\d+)</PartNumber>.*?<ETag>(.*?)</ETag>.*?</Part>', dotAll: true).allMatches(res.body);
+      for (final m in matches) {
+        allParts.add({'PartNumber': int.parse(m.group(1)!), 'ETag': m.group(2)!.replaceAll('"', '')});
+      }
+
+      final truncMatch = RegExp(r'<IsTruncated>(true|false)</IsTruncated>', caseSensitive: false).firstMatch(res.body);
+      isTruncated = truncMatch?.group(1)?.toLowerCase() == 'true';
+
+      if (isTruncated) {
+        final nextMarkerMatch = RegExp(r'<NextPartNumberMarker>(\d+)</NextPartNumberMarker>').firstMatch(res.body);
+        partNumberMarker = nextMarkerMatch?.group(1);
+      }
     }
-    return parts;
+    return allParts;
   }
 
-  static const int _partSize = 5 * 1024 * 1024; // 5MB 分片界限
+
+  // ==================== [新增] 超大文件动态分片弹性缩放引擎 ====================
+  int _getOptimalPartSize(int fileSize) {
+    int size = 5 * 1024 * 1024; // 基础界限：5MB
+    if (fileSize > 0) {
+      int parts = (fileSize / size).ceil();
+      // 强行把总分片数压制在 900 以内，完美避开所有 S3 厂商的 1000/1024 限制与分页 Bug
+      if (parts > 900) {
+        size = (fileSize / 900).ceil();
+      }
+    }
+    return size;
+  }
 
   S3StorageService() { _loadConfig(); }
 
@@ -401,14 +445,31 @@ class S3StorageService with ChangeNotifier {
     return items;
   }
 
-  // ==================== [终极进化] 极速并发下载引擎 ====================
+  // ==================== [终极进化] 极速并发下载引擎 (带容错重试) ====================
   Future<void> downloadFile(String key, String localPath, int fileSize, TransferTask task) async {
     if (!isConfigured) return;
     
     final file = File(localPath);
-    // [核心技术]：预先撑开占位文件，以便多个线程在不同的 Offset 随意写入
+    
+    // [核心修复 1]：确保父级目录必须存在，防止手机端直接抛出 FileSystemException
+    if (!await file.parent.exists()) {
+      await file.parent.create(recursive: true);
+    }
+    
+    //[兼容性修复]：防备 0 字节的原生文件夹标记文件直接完成
+    if (fileSize == 0) {
+      await file.writeAsBytes([]);
+      task.updateOverall(1.0, '完成');
+      return;
+    }
+
+    // 预先撑开占位文件，以便多个线程在不同的 Offset 随意写入
     final raf = await file.open(mode: FileMode.write);
-    await raf.truncate(fileSize); 
+    try {
+      await raf.truncate(fileSize); 
+    } catch (e) {
+      debugPrint("部分移动设备不支持 truncate，自动忽略并回退写入扩展: $e");
+    }
 
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(_sanitizeKey(key));
@@ -421,41 +482,67 @@ class S3StorageService with ChangeNotifier {
     int downloadedBytes = 0;
     final startT = DateTime.now().millisecondsSinceEpoch;
 
-    // 分片下载核心函数
+    // 分片下载核心函数（新增重试机制）
     Future<void> downloadPart(int start, int end, int pNum) async {
-      final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, extraHeaders: {'Range': 'bytes=$start-$end', 'Connection': 'close'}, ak: _ak!, sk: _sk!);
-      final req = http.Request('GET', Uri.parse('$_endpoint$path'))..headers.addAll(headers);
-      final client = http.Client();
-      try {
-        final res = await client.send(req);
-        if (res.statusCode != 206 && res.statusCode != 200) throw Exception("HTTP ${res.statusCode}");
+      const int maxRetries = 3;
+      for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        if (task.isCancelled) return;
+        int downloadedThisAttempt = 0;
+        final client = http.Client();
         
-        // 1. 将 5MB 分片下载到内存中
-        final builder = BytesBuilder();
-        await for (final chunk in res.stream) {
-          if (task.isCancelled) throw Exception("取消");
-          builder.add(chunk);
-          downloadedBytes += chunk.length;
+        try {
+          task.updatePart(pNum, 0.0, attempt > 1 ? '重试($attempt/3)' : '下载中...');
+          final headers = S3Signer.generateV4Headers(method: 'GET', host: host, path: path, extraHeaders: {'Range': 'bytes=$start-$end', 'Connection': 'close'}, ak: _ak!, sk: _sk!);
+          final req = http.Request('GET', Uri.parse('$_endpoint$path'))..headers.addAll(headers);
           
-          final el = (DateTime.now().millisecondsSinceEpoch - startT) / 1000.0;
-          task.updateOverall(downloadedBytes / fileSize.toDouble(), el > 0 ? '${formatSize(downloadedBytes / el)}/s' : '...');
-          task.updatePart(pNum, builder.length / (end - start + 1), '下载中');
+          // [核心修复 2]：给数据流读写加入整体超时，应对移动端假死断网
+          await Future(() async {
+            final res = await client.send(req);
+            if (res.statusCode != 206 && res.statusCode != 200) throw Exception("HTTP ${res.statusCode}");
+            
+            final builder = BytesBuilder();
+            await for (final chunk in res.stream) {
+              if (task.isCancelled) throw Exception("取消");
+              builder.add(chunk);
+              downloadedThisAttempt += chunk.length;
+              downloadedBytes += chunk.length;
+              
+              final el = (DateTime.now().millisecondsSinceEpoch - startT) / 1000.0;
+              task.updateOverall(downloadedBytes / fileSize.toDouble(), el > 0 ? '${formatSize(downloadedBytes / el)}/s' : '...');
+              task.updatePart(pNum, builder.length / (end - start + 1), '下载中');
+            }
+            
+            final fullBytes = builder.takeBytes();
+            await mutex.synchronized(() async {
+              await raf.setPosition(start);
+              await raf.writeFrom(fullBytes);
+            });
+          }).timeout(const Duration(minutes: 5));
+          
+          task.updatePart(pNum, 1.0, '完成');
+          return; // 成功则退出重试循环
+        } catch (e) {
+          // 若本轮异常，扣除进度条已累加的假进度，防超界
+          downloadedBytes -= downloadedThisAttempt;
+          if (task.isCancelled) return;
+          
+          if (attempt == maxRetries) {
+            task.updatePart(pNum, 0.0, '失败');
+            throw Exception("分片 $pNum 异常: $e");
+          }
+          task.updatePart(pNum, 0.0, '等待重试');
+          await Future.delayed(Duration(seconds: attempt * 2));
+        } finally {
+          client.close();
         }
-        
-        // 2. 利用互斥锁安全写入硬盘对应位置
-        final fullBytes = builder.takeBytes();
-        await mutex.synchronized(() async {
-          await raf.setPosition(start);
-          await raf.writeFrom(fullBytes);
-        });
-        task.updatePart(pNum, 1.0, '完成');
-      } finally {
-        client.close();
       }
     }
 
+    //[引入弹性缩放引擎]：下载大文件时，单块放大，极度减少 TCP 握手次数
+    final partSize = _getOptimalPartSize(fileSize);
+
     // 滑动窗口并发切割下载
-    for (int i = 0; i < fileSize; i += _partSize) {
+    for (int i = 0; i < fileSize; i += partSize) {
       if (task.isCancelled || hasError) break;
       while (activeDownloads >= 4 && !hasError && !task.isCancelled) {
         await Future.delayed(const Duration(milliseconds: 10));
@@ -463,17 +550,18 @@ class S3StorageService with ChangeNotifier {
       if (task.isCancelled || hasError) break;
 
       activeDownloads++;
-      int end = (i + _partSize - 1 < fileSize) ? i + _partSize - 1 : fileSize - 1;
-      int pNum = (i / _partSize).floor() + 1;
+      int end = (i + partSize - 1 < fileSize) ? i + partSize - 1 : fileSize - 1;
+      int pNum = (i / partSize).floor() + 1;
 
-        allTasks.add(downloadPart(i, end, pNum).then((_) => activeDownloads--).catchError((e) {
+      allTasks.add(downloadPart(i, end, pNum).then((_) => activeDownloads--).catchError((e) {
         hasError = true; errorMsg = e.toString(); activeDownloads--;
-        return 0;
+        // [核心修复 3]：原先此处错误地 return 0 导致 Dart 强转 Future<void> 抛出类型异常
+        return Future.value(); 
       }));
     }
 
     await Future.wait(allTasks);
-    await raf.close(); // 关闭流
+    await raf.close();
 
     if (task.isCancelled) { file.deleteSync(); throw Exception("用户取消"); }
     if (hasError) { file.deleteSync(); throw Exception(errorMsg); }
@@ -484,19 +572,22 @@ class S3StorageService with ChangeNotifier {
     final cleanKey = _sanitizeKey(remoteKey);
     final file = File(localPath);
     final fileSize = await file.length();
+    
+    //[获取当前文件的最佳专属分片尺寸]
+    final partSize = _getOptimalPartSize(fileSize);
 
-    if (fileSize <= _partSize) {
+    if (fileSize <= partSize) {
       final bytes = await file.readAsBytes();
       await _uploadSingleFile(cleanKey, bytes);
       task.complete(null);
     } else {
-      await _uploadMultipartFile(file, cleanKey, fileSize, task);
+      await _uploadMultipartFile(file, cleanKey, fileSize, task, partSize); // 传入 partSize
     }
   }
 
   /// [核心新增] OSCA > 100M 多分片上传支持
-  // ====================[终极安全版] 彻底根除暗箱头与签名 403 陷阱 ====================
-  Future<void> _uploadMultipartFile(File file, String key, int fileSize, TransferTask task) async {
+  // ====================[终极安全版] 彻底根除暗箱头与签名 403 陷阱 + 全局校验自愈 ====================
+  Future<void> _uploadMultipartFile(File file, String key, int fileSize, TransferTask task, int partSize) async {
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
 
@@ -504,7 +595,6 @@ class S3StorageService with ChangeNotifier {
     final initRes = await http.post(Uri.parse('$_endpoint$path?uploads='), headers: initHeaders);
     if (initRes.statusCode != 200) throw Exception("初始化分片失败: ${initRes.body}");
     
-    // 兼容部分 S3 服务端返回标签大小写不一致的问题
     final match = RegExp(r'<[Uu]ploadId>(.*?)</[Uu]ploadId>').firstMatch(initRes.body);
     if (match == null) throw Exception("无法获取 UploadId");
     final uploadId = match.group(1)!;
@@ -525,7 +615,7 @@ class S3StorageService with ChangeNotifier {
     bool hasError = false;
     String errorMsg = "";
 
-    // 内存控制：死死压住最多只有 4x5MB = 20MB 在内存中
+    // 阶段一：常规并发推送
     final raf = await file.open(mode: FileMode.read);
     int partNumber = 1;
 
@@ -538,7 +628,7 @@ class S3StorageService with ChangeNotifier {
         }
         if (task.isCancelled || hasError) break;
 
-        final chunkBytes = await raf.read(_partSize);
+        final chunkBytes = await raf.read(partSize);
         if (chunkBytes.isEmpty) break; // 读取完毕
 
         activeUploads++;
@@ -560,13 +650,80 @@ class S3StorageService with ChangeNotifier {
     if (task.isCancelled) throw Exception("用户取消");
     if (hasError) throw Exception(errorMsg);
 
-    uploadedParts.sort((a, b) => (a['PartNumber'] as int).compareTo(b['PartNumber'] as int));
-    final completeXml = _buildCompleteXml(uploadedParts);
+    // ==================== [新增] 阶段二：全局分片校验与自愈机制 ====================
+    task.updateOverall(1.0, '正在校验云端数据...');
+    
+    // 1. 获取云端实际已接收的分片
+    List<Map<String, dynamic>> serverParts = await _listParts(key, uploadId);
+    Set<int> serverPartNumbers = serverParts.map((p) => p['PartNumber'] as int).toSet();
+    
+    // 2. 计算预期的所有分片序号
+    int expectedTotalParts = (fileSize / partSize).ceil();
+    if (fileSize == 0) expectedTotalParts = 1;
+
+    List<int> missingParts =[];
+    for (int i = 1; i <= expectedTotalParts; i++) {
+      if (!serverPartNumbers.contains(i)) {
+        missingParts.add(i);
+      }
+    }
+
+    // 3. 存在缺失或错误落盘的分片，触发断点自愈修复
+    if (missingParts.isNotEmpty) {
+      task.updateOverall(1.0, '修复 ${missingParts.length} 个缺失分片...');
+      final rafRepair = await file.open(mode: FileMode.read);
+      activeUploads = 0;
+      allTasks.clear();
+      hasError = false;
+
+      try {
+        for (int pNum in missingParts) {
+          if (task.isCancelled || hasError) break;
+          while (activeUploads >= 4 && !hasError && !task.isCancelled) {
+            await Future.delayed(const Duration(milliseconds: 10));
+          }
+          if (task.isCancelled || hasError) break;
+
+          activeUploads++;
+          
+          // 定位到该分片在文件中的精确偏移量并读取
+          int offset = (pNum - 1) * partSize;
+          await rafRepair.setPosition(offset);
+          int bytesToRead = (offset + partSize > fileSize) ? fileSize - offset : partSize;
+          final chunkBytes = await rafRepair.read(bytesToRead);
+
+          // 传入空的闭包 (bytes){} 避免修复动作干扰整体的已上传字节进度计算
+          final future = _sendPart(chunkBytes, pNum, uploadId, path, host, uploadedParts, task, (bytes){})
+              .then((_) => activeUploads--)
+              .catchError((e) {
+                 hasError = true; errorMsg = e.toString(); activeUploads--;
+              });
+          allTasks.add(future);
+        }
+        await Future.wait(allTasks);
+      } finally {
+        await rafRepair.close();
+      }
+
+      if (task.isCancelled) throw Exception("用户取消");
+      if (hasError) throw Exception("修复分片失败: $errorMsg");
+
+      // 修复完成后，重新拉取一次云端分片列表确保万无一失
+      serverParts = await _listParts(key, uploadId);
+    }
+
+    // ==================== 阶段三：最终云端组装 ====================
+    // [核心安全策略] 弃用本地收集的 uploadedParts 列表，强制采用从云端拉回的真实 serverParts 组装XML
+    serverParts.sort((a, b) => (a['PartNumber'] as int).compareTo(b['PartNumber'] as int));
+    final completeXml = _buildCompleteXml(serverParts);
     final completeBytes = utf8.encode(completeXml);
     
     final completeHeaders = S3Signer.generateV4Headers(method: 'POST', host: host, path: path, queryParams: {'uploadId': uploadId}, ak: _ak!, sk: _sk!, payloadBytes: completeBytes);
     final completeRes = await http.post(Uri.parse('$_endpoint$path?uploadId=$uploadId'), headers: completeHeaders, body: completeBytes);
+    
     if (completeRes.statusCode != 200) throw Exception("合并分片失败: ${completeRes.body}");
+    
+    task.complete(null);
   }
 
   String _buildCompleteXml(List<Map<String, dynamic>> parts) {
@@ -631,13 +788,9 @@ class S3StorageService with ChangeNotifier {
         );
 
         final url = Uri.parse('$_endpoint$path?partNumber=$pNum&uploadId=$safeUploadId');
-        final request = http.StreamedRequest('PUT', url);
-        request.headers.addAll(headers);
-        request.contentLength = chunkBytes.length;
 
         final startT = DateTime.now().millisecondsSinceEpoch;
 
-        // 使用 async* 配合较小的 chunk 实现流式进度更新，依靠底层机制控制速率
         Stream<List<int>> streamData() async* {
           const chunkSize = 128 * 1024;
           for (int i = 0; i < chunkBytes.length; i += chunkSize) {
@@ -655,30 +808,38 @@ class S3StorageService with ChangeNotifier {
           }
         }
 
-        final responseFuture = client.send(request);
-        
-        await request.sink.addStream(streamData());
-        request.sink.close();
+        // [核心修复]：使用 Future 包装并施加 Timeout。强制打断断网导致的 request.sink 幽灵阻塞
+        await Future(() async {
+          final request = http.StreamedRequest('PUT', url);
+          request.headers.addAll(headers);
+          request.contentLength = chunkBytes.length;
+          
+          final responseFuture = client.send(request);
+          
+          await request.sink.addStream(streamData());
+          request.sink.close();
 
-        final streamedResponse = await responseFuture.timeout(const Duration(minutes: 5));
-        final response = await http.Response.fromStream(streamedResponse);
+          final streamedResponse = await responseFuture;
+          final response = await http.Response.fromStream(streamedResponse);
 
-        if (response.statusCode != 200) {
-          String errMsg = response.body;
-          final match = RegExp(r'<Code>(.*?)</Code>').firstMatch(errMsg);
-          if (match != null) errMsg = match.group(1)!;
-          throw Exception("${response.statusCode} - $errMsg");
-        }
+          if (response.statusCode != 200) {
+            String errMsg = response.body;
+            final match = RegExp(r'<Code>(.*?)</Code>').firstMatch(errMsg);
+            if (match != null) errMsg = match.group(1)!;
+            throw Exception("${response.statusCode} - $errMsg");
+          }
 
-        String? etag = response.headers['etag'] ?? response.headers['ETag'];
-        if (etag == null || etag.isEmpty) {
-          final match = RegExp(r'<ETag>(.*?)</ETag>', caseSensitive: false).firstMatch(response.body);
-          etag = match?.group(1);
-        }
-        if (etag == null || etag.isEmpty) throw Exception("缺失 ETag");
-        etag = etag.replaceAll('"', '');
+          String? etag = response.headers['etag'] ?? response.headers['ETag'];
+          if (etag == null || etag.isEmpty) {
+            final match = RegExp(r'<ETag>(.*?)</ETag>', caseSensitive: false).firstMatch(response.body);
+            etag = match?.group(1);
+          }
+          if (etag == null || etag.isEmpty) throw Exception("缺失 ETag");
+          etag = etag.replaceAll('"', '');
 
-        uploadedParts.add({'PartNumber': pNum, 'ETag': etag});
+          uploadedParts.add({'PartNumber': pNum, 'ETag': etag});
+        }).timeout(const Duration(minutes: 5));
+
         task.updatePart(pNum, 1.0, '完成');
         return;
 
@@ -698,7 +859,7 @@ class S3StorageService with ChangeNotifier {
         task.updatePart(pNum, 0.0, uiErrorText);
         await Future.delayed(Duration(seconds: attempt * 2));
       } finally {
-        client.close();
+        client.close(); // 当 timeout 触发时，finally 会强制摧毁挂起的 socket，完美释放资源
       }
     }
   }

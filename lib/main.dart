@@ -351,7 +351,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                 SizedBox(height: 10),
                 TextField(controller: pathCtrl, decoration: InputDecoration(labelText: '所属路径 (例如 folder/)', border: OutlineInputBorder())),
                 SizedBox(height: 8),
-                Text('⚠️ S3特性：修改路径或名称将触发复制并删除原文件', style: TextStyle(fontSize: 12, color: Colors.orange)),
+                Text('⚠️ 提示：修改路径或名称将触发复制并删除原文件', style: TextStyle(fontSize: 12, color: Colors.orange)),
               ] else ...[
                 Text('⚠️ 提示：S3 架构不支持直接重命名文件夹，如有需要请新建文件夹后移动内部文件。', style: TextStyle(color: Colors.grey)),
               ]
