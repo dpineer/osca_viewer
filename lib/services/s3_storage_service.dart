@@ -171,7 +171,7 @@ class S3StorageService with ChangeNotifier {
     );
   }
 
-  // ==================== [修复] 获取云端分片 (修复严格模式 S3 签名屏蔽问题) ====================
+  // ==================== [修复] 获取云端分片 (修复严格模式 S3 签名屏蔽问题及XML解析截断缺陷) ====================
   Future<List<Map<String, dynamic>>> _listParts(String key, String uploadId) async {
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
@@ -195,7 +195,6 @@ class S3StorageService with ChangeNotifier {
         sk: _sk!
       );
       
-      // [核心修复]：必须对 Query Params 进行字典排序后拼接 URL，否则严格厂商将直接抛出 403 阻断分页！
       final sortedKeys = queryParams.keys.toList()..sort();
       final queryParts = sortedKeys.map((k) => '${S3Signer.uriEncode(k)}=${S3Signer.uriEncode(queryParams[k]!)}').join('&');
       
@@ -203,9 +202,20 @@ class S3StorageService with ChangeNotifier {
       
       if (res.statusCode != 200) throw Exception("获取云端分片列表失败: ${res.statusCode}");
 
-      final matches = RegExp(r'<Part>.*?<PartNumber>(\d+)</PartNumber>.*?<ETag>(.*?)</ETag>.*?</Part>', dotAll: true).allMatches(res.body);
-      for (final m in matches) {
-        allParts.add({'PartNumber': int.parse(m.group(1)!), 'ETag': m.group(2)!.replaceAll('"', '')});
+      // [核心修复]：废弃跨界单行正则。改为先提取单个 <Part> 块，在块内进行无序独立匹配。
+      // 杜绝因 S3 厂商返回节点乱序导致正则吞噬相邻 Part，进而造成分片折半的严重 Bug。
+      final partMatches = RegExp(r'<Part>(.*?)</Part>', dotAll: true).allMatches(res.body);
+      for (final m in partMatches) {
+        final partBlock = m.group(1)!;
+        final pNumMatch = RegExp(r'<PartNumber>(\d+)</PartNumber>').firstMatch(partBlock);
+        final eTagMatch = RegExp(r'<ETag>(.*?)</ETag>').firstMatch(partBlock);
+        
+        if (pNumMatch != null && eTagMatch != null) {
+          allParts.add({
+            'PartNumber': int.parse(pNumMatch.group(1)!), 
+            'ETag': eTagMatch.group(1)!.replaceAll('"', '')
+          });
+        }
       }
 
       final truncMatch = RegExp(r'<IsTruncated>(true|false)</IsTruncated>', caseSensitive: false).firstMatch(res.body);
@@ -672,6 +682,8 @@ class S3StorageService with ChangeNotifier {
     if (missingParts.isNotEmpty) {
       task.updateOverall(1.0, '修复 ${missingParts.length} 个缺失分片...');
       final rafRepair = await file.open(mode: FileMode.read);
+      final repairMutex = FileMutex(); // [核心修复]：实例化互斥锁，保护文件指针状态机
+      
       activeUploads = 0;
       allTasks.clear();
       hasError = false;
@@ -688,9 +700,15 @@ class S3StorageService with ChangeNotifier {
           
           // 定位到该分片在文件中的精确偏移量并读取
           int offset = (pNum - 1) * partSize;
-          await rafRepair.setPosition(offset);
           int bytesToRead = (offset + partSize > fileSize) ? fileSize - offset : partSize;
-          final chunkBytes = await rafRepair.read(bytesToRead);
+          Uint8List chunkBytes = Uint8List(0);
+          
+          // [核心修复]：将 setPosition 与 read 包裹进入同步互斥锁中
+          // 彻底阻断因 activeUploads 发起的并发线程覆写当前指针产生的脏数据串流
+          await repairMutex.synchronized(() async {
+            await rafRepair.setPosition(offset);
+            chunkBytes = await rafRepair.read(bytesToRead);
+          });
 
           // 传入空的闭包 (bytes){} 避免修复动作干扰整体的已上传字节进度计算
           final future = _sendPart(chunkBytes, pNum, uploadId, path, host, uploadedParts, task, (bytes){})
