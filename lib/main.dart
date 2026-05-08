@@ -91,13 +91,13 @@ class _ConfigPageState extends State<ConfigPage> {
   final TextEditingController _endpointController = TextEditingController();
   final TextEditingController _bucketController = TextEditingController();
   bool _isLoading = false;
-  int? _linkExpireSeconds = 86400; // 默认一天，null 表示无限
+  int? _linkExpireSeconds = 86400; // 默认一天，null 表示31年
   final TextEditingController _customDaysController = TextEditingController();
   final TextEditingController _customHoursController = TextEditingController();
   bool _isCustomSelected = false; // 标记当前是否处于自定义选中状态
   // 预设的固定选项值（秒）
   static const List<int> _fixedExpireOptions = [3600, 86400, 604800];
-  // 自定义和无限用特殊值标记
+  // 自定义和31年用特殊值标记
   static const int _customFlag = -1;
   static const int _infiniteFlag = -2;
 
@@ -118,7 +118,7 @@ class _ConfigPageState extends State<ConfigPage> {
         _bucketController.text = prefs.getString('bucket') ?? '';
         final stored = prefs.getInt('link_expire_seconds');
         if (stored == null || stored == -1) {
-          // -1 表示无限时间
+          // -1 表示31年时间
           _linkExpireSeconds = null;
         } else {
           _linkExpireSeconds = stored;
@@ -194,7 +194,7 @@ class _ConfigPageState extends State<ConfigPage> {
             ),
             Divider(height: 40),
             
-            // [增强]：外链有效期配置（支持自定义和无限）
+            // [增强]：外链有效期配置（支持自定义和31年）
             ListTile(
               title: Text('分享外链有效期'),
               subtitle: Text('影响通过APP复制出的分享直链存活时间'),
@@ -205,7 +205,7 @@ class _ConfigPageState extends State<ConfigPage> {
                   DropdownMenuItem(value: 86400, child: Text('1 天')),
                   DropdownMenuItem(value: 604800, child: Text('7 天')),
                   DropdownMenuItem(value: _customFlag, child: Text('自定义...')),
-                  DropdownMenuItem(value: _infiniteFlag, child: Text('无限（永久）')),
+                  DropdownMenuItem(value: _infiniteFlag, child: Text('31年')),
                 ],
                 onChanged: (val) {
                   if (val == null) return;
@@ -262,7 +262,7 @@ class _ConfigPageState extends State<ConfigPage> {
       );
       
       final prefs = await SharedPreferences.getInstance();
-      // null 表示无限时间，存储为 -1
+      // null 表示31年时间，存储为 -1
       await prefs.setInt('link_expire_seconds', _linkExpireSeconds ?? -1);
       
       // 如果是从文件列表的"设置"图标 push 进来的，认证成功后要 pop 退出
@@ -942,11 +942,11 @@ class _ShareManagerPageState extends State<ShareManagerPage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已清理 ${expiredIndexes.length} 个过期链接')));
   }
 
-  // 计算剩余相对时间（无限时间显示"永久有效"）
+  // 计算剩余相对时间（31年时间显示"31年有效"）
   String _getRemainingTime(int expireAt) {
-    // 如果过期时间在 2050 年之后，视为永久链接
+    // 如果过期时间在 2050 年之后，视为31年链接
     if (expireAt > DateTime(2050, 1, 1).millisecondsSinceEpoch) {
-      return "永久有效";
+      return "31年有效";
     }
     final diff = DateTime.fromMillisecondsSinceEpoch(expireAt).difference(DateTime.now());
     if (diff.isNegative) return "已过期";
