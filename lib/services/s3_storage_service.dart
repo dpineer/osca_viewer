@@ -136,7 +136,10 @@ class S3StorageService with ChangeNotifier {
     final url = await getShareUrl(key, fileName);
     final prefs = await SharedPreferences.getInstance();
     final expiresIn = prefs.getInt('link_expire_seconds') ?? 86400;
-    final expireAt = DateTime.now().millisecondsSinceEpoch + (expiresIn * 1000);
+    // -1 表示无限时间
+    final expireAt = (expiresIn == -1)
+        ? DateTime(2099, 12, 31, 23, 59, 59).millisecondsSinceEpoch
+        : DateTime.now().millisecondsSinceEpoch + (expiresIn * 1000);
 
     _shareHistory.insert(0, {
       'fileName': fileName,
@@ -161,13 +164,15 @@ class S3StorageService with ChangeNotifier {
   Future<String> getShareUrl(String key, String fileName) async {
     if (!isConfigured) return '';
     final prefs = await SharedPreferences.getInstance();
-    final expiresIn = prefs.getInt('link_expire_seconds') ?? 86400; 
+    final expiresIn = prefs.getInt('link_expire_seconds') ?? 86400;
+    // -1 表示无限时间，传递一个极大值（约 31 年）
+    final effectiveExpiresIn = (expiresIn == -1) ? 999999999 : expiresIn;
 
     final host = Uri.parse(_endpoint!).host;
     final path = _encodePath(key);
     // 只生成链接并返回，不再在此处向 SharedPreferences 写数据，避免与 generateAndSaveShareUrl 冲突
     return S3Signer.generatePresignedUrl(
-      endpoint: _endpoint!, host: host, path: path, ak: _ak!, sk: _sk!, expiresIn: expiresIn
+      endpoint: _endpoint!, host: host, path: path, ak: _ak!, sk: _sk!, expiresIn: effectiveExpiresIn
     );
   }
 

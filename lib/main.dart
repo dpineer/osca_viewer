@@ -91,7 +91,15 @@ class _ConfigPageState extends State<ConfigPage> {
   final TextEditingController _endpointController = TextEditingController();
   final TextEditingController _bucketController = TextEditingController();
   bool _isLoading = false;
-  int _linkExpireSeconds = 86400; // 默认一天
+  int? _linkExpireSeconds = 86400; // 默认一天，null 表示无限
+  final TextEditingController _customDaysController = TextEditingController();
+  final TextEditingController _customHoursController = TextEditingController();
+  bool _isCustomSelected = false; // 标记当前是否处于自定义选中状态
+  // 预设的固定选项值（秒）
+  static const List<int> _fixedExpireOptions = [3600, 86400, 604800];
+  // 自定义和无限用特殊值标记
+  static const int _customFlag = -1;
+  static const int _infiniteFlag = -2;
 
   @override
   void initState() {
@@ -108,7 +116,13 @@ class _ConfigPageState extends State<ConfigPage> {
         _skController.text = prefs.getString('sk') ?? '';
         _endpointController.text = prefs.getString('endpoint') ?? '';
         _bucketController.text = prefs.getString('bucket') ?? '';
-        _linkExpireSeconds = prefs.getInt('link_expire_seconds') ?? 86400;
+        final stored = prefs.getInt('link_expire_seconds');
+        if (stored == null || stored == -1) {
+          // -1 表示无限时间
+          _linkExpireSeconds = null;
+        } else {
+          _linkExpireSeconds = stored;
+        }
       });
     }
   }
@@ -180,19 +194,28 @@ class _ConfigPageState extends State<ConfigPage> {
             ),
             Divider(height: 40),
             
-            // [新增]：外链有效期配置
+            // [增强]：外链有效期配置（支持自定义和无限）
             ListTile(
               title: Text('分享外链有效期'),
               subtitle: Text('影响通过APP复制出的分享直链存活时间'),
               trailing: DropdownButton<int>(
-                value: _linkExpireSeconds,
-                items:[
+                value: _linkExpireSeconds ?? _infiniteFlag,
+                items: [
                   DropdownMenuItem(value: 3600, child: Text('1 小时')),
                   DropdownMenuItem(value: 86400, child: Text('1 天')),
                   DropdownMenuItem(value: 604800, child: Text('7 天')),
+                  DropdownMenuItem(value: _customFlag, child: Text('自定义...')),
+                  DropdownMenuItem(value: _infiniteFlag, child: Text('无限（永久）')),
                 ],
                 onChanged: (val) {
-                  if (val != null) setState(() => _linkExpireSeconds = val);
+                  if (val == null) return;
+                  if (val == _customFlag) {
+                    _showCustomTimeDialog();
+                  } else if (val == _infiniteFlag) {
+                    setState(() => _linkExpireSeconds = null);
+                  } else {
+                    setState(() => _linkExpireSeconds = val);
+                  }
                 },
               ),
             ),
@@ -239,7 +262,8 @@ class _ConfigPageState extends State<ConfigPage> {
       );
       
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt('link_expire_seconds', _linkExpireSeconds);
+      // null 表示无限时间，存储为 -1
+      await prefs.setInt('link_expire_seconds', _linkExpireSeconds ?? -1);
       
       // 如果是从文件列表的"设置"图标 push 进来的，认证成功后要 pop 退出
       if (mounted && Navigator.canPop(context)) {
@@ -249,6 +273,69 @@ class _ConfigPageState extends State<ConfigPage> {
       _showMsg("连接失败: $e", isError: true);
     } finally {
       if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  // [新增]：弹出自定义时间输入框
+  Future<void> _showCustomTimeDialog() async {
+    _customDaysController.clear();
+    _customHoursController.clear();
+    final result = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('自定义外链有效期'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _customDaysController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                labelText: '天数',
+                hintText: '0',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            SizedBox(height: 12),
+            TextField(
+              controller: _customHoursController,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                labelText: '小时',
+                hintText: '0',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            SizedBox(height: 8),
+            Text(
+              '总有效期为 ${_customDaysController.text.isEmpty ? 0 : int.tryParse(_customDaysController.text) ?? 0} 天 '
+              '${_customHoursController.text.isEmpty ? 0 : int.tryParse(_customHoursController.text) ?? 0} 小时',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text('取消')),
+          ElevatedButton(
+            onPressed: () {
+              final days = int.tryParse(_customDaysController.text) ?? 0;
+              final hours = int.tryParse(_customHoursController.text) ?? 0;
+              final totalSeconds = days * 86400 + hours * 3600;
+              if (totalSeconds < 60) {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  SnackBar(content: Text('有效期至少为 1 分钟'), backgroundColor: Colors.red),
+                );
+                return;
+              }
+              Navigator.pop(ctx, totalSeconds);
+            },
+            child: Text('确认'),
+          ),
+        ],
+      ),
+    );
+    if (result != null && mounted) {
+      setState(() => _linkExpireSeconds = result);
     }
   }
 
@@ -855,8 +942,12 @@ class _ShareManagerPageState extends State<ShareManagerPage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已清理 ${expiredIndexes.length} 个过期链接')));
   }
 
-  // 计算剩余相对时间
+  // 计算剩余相对时间（无限时间显示"永久有效"）
   String _getRemainingTime(int expireAt) {
+    // 如果过期时间在 2050 年之后，视为永久链接
+    if (expireAt > DateTime(2050, 1, 1).millisecondsSinceEpoch) {
+      return "永久有效";
+    }
     final diff = DateTime.fromMillisecondsSinceEpoch(expireAt).difference(DateTime.now());
     if (diff.isNegative) return "已过期";
     if (diff.inDays > 0) return "剩 ${diff.inDays} 天 ${diff.inHours % 24} 小时";
