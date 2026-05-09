@@ -372,6 +372,10 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
   bool _isSearching = false;
   String _searchQuery = '';
 
+  // ================= [新增] 状态层：批量操作支持 =================
+  bool _isSelectMode = false; // 是否处于多选模式
+  Set<String> _selectedFiles = {}; // 已选中的文件 key 集合
+
   // [新增]: 本地过滤当前目录文件
   List<Map<String, dynamic>> get _filteredFiles {
     if (_searchQuery.isEmpty) return _files;
@@ -508,57 +512,111 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     }
   }
 
-  // [配套修改]: 下载方法不再需要 finally 去兜底关闭
-  // [重构]：彻底非阻塞的后台下载机制
+  // ================= [新增] 下载引擎：公共路径选择器 =================
+  Future<String?> _pickDownloadDirectory() async {
+    if (Platform.isAndroid) {
+      Directory? dir = await getExternalStorageDirectory();
+      return dir?.path ?? (await getApplicationDocumentsDirectory()).path;
+    } else if (Platform.isIOS) {
+      Directory dir = await getApplicationDocumentsDirectory();
+      return dir.path;
+    } else {
+      // 桌面端 (包括您的 Debian Linux 环境) 调用系统目录选择器
+      return await FilePicker.platform.getDirectoryPath();
+    }
+  }
+
+  // ================= [重构] 下载引擎：基础单文件下载 =================
   Future<void> _handleDownload(Map<String, dynamic> item) async {
     if (item['isDir']) {
       _showMsg("暂不支持直接下载整个文件夹", isError: true);
       return;
     }
 
-    String localDir = "";
-    if (Platform.isAndroid) {
-      Directory? dir = await getExternalStorageDirectory();
-      localDir = dir?.path ?? (await getApplicationDocumentsDirectory()).path;
-    } else if (Platform.isIOS) {
-      Directory dir = await getApplicationDocumentsDirectory();
-      localDir = dir.path;
-    } else {
-      String? selected = await FilePicker.platform.getDirectoryPath();
-      if (selected == null) return;
-      localDir = selected;
-    }
+    String? localDir = await _pickDownloadDirectory();
+    if (localDir == null) return;
 
     String localPath = p.join(localDir, item['name']);
     final task = TransferTask(item['name'], isUpload: false);
     context.read<TransferManager>().addTask(task);
     _showMsg("已加入并发下载队列");
 
+    _performDownload(item['key'], localPath, item['size'], task);
+  }
+
+  // ================= [新增] 下载引擎：批量多选并发下载 =================
+  Future<void> _handleBatchDownload() async {
+    final itemsToDownload = _filteredFiles.where((f) => _selectedFiles.contains(f['key']) && !f['isDir']).toList();
+    if (itemsToDownload.isEmpty) {
+      _showMsg("请选择包含非文件夹的文件", isError: true);
+      return;
+    }
+
+    // 批量下载只需要选择一次保存目录
+    String? localDir = await _pickDownloadDirectory();
+    if (localDir == null) return;
+
+    for (var item in itemsToDownload) {
+      String localPath = p.join(localDir, item['name']);
+      final task = TransferTask(item['name'], isUpload: false);
+      context.read<TransferManager>().addTask(task);
+      
+      // 注入并发执行流
+      _performDownload(item['key'], localPath, item['size'], task);
+    }
+
+    _showMsg("已将 ${itemsToDownload.length} 个文件加入并发下载队列");
+    setState(() {
+      _isSelectMode = false;
+      _selectedFiles.clear();
+    });
+  }
+
+  // 后台独立执行的下载任务单元
+  Future<void> _performDownload(String key, String localPath, int size, TransferTask task) async {
     try {
-      // 传入 fileSize 以启动分块加速引擎
-      await context.read<S3StorageService>().downloadFile(item['key'], localPath, item['size'], task);
+      await context.read<S3StorageService>().downloadFile(key, localPath, size, task);
       if (!task.isCancelled) task.complete((t) => context.read<TransferManager>().removeTask(t));
     } catch (e) {
       if (!task.isCancelled) task.error(e.toString());
     }
   }
 
-  // [重构]：非阻塞上传
+  // ================= [重构] 上传引擎：支持多文件极速并发 =================
   Future<void> _handleUpload() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles();
-    if (result == null || result.files.single.path == null) return;
-    String localPath = result.files.single.path!;
-    String fileName = result.files.single.name;
-    
-    final task = TransferTask(fileName, isUpload: true);
-    context.read<TransferManager>().addTask(task);
-    _showMsg("已加入上传队列，正在后台极速并发上传");
+    // 开启多文件选择 (allowMultiple: true)
+    FilePickerResult? result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (result == null || result.files.isEmpty) return;
 
+    int addedCount = 0;
+    for (var file in result.files) {
+      if (file.path == null) continue;
+      String localPath = file.path!;
+      String fileName = file.name;
+      
+      final task = TransferTask(fileName, isUpload: true);
+      context.read<TransferManager>().addTask(task);
+      addedCount++;
+      
+      // 剥离上传动作，使其在后台非阻塞执行
+      _performUpload(localPath, fileName, task);
+    }
+    
+    if (addedCount > 0) {
+      _showMsg("已将 $addedCount 个文件加入上传队列，正在后台极速并发上传");
+    }
+  }
+
+  // 后台独立执行的上传任务单元
+  Future<void> _performUpload(String localPath, String fileName, TransferTask task) async {
     try {
       await context.read<S3StorageService>().uploadFile(localPath, "$_currentPrefix$fileName", task);
       if (!task.isCancelled) {
         task.complete((t) => context.read<TransferManager>().removeTask(t));
-        _loadFiles(); // 成功后刷新列表
+        // 降低列表高频刷新的开销：如果所有上传任务都已经完成，则刷新列表
+        if (mounted && context.read<TransferManager>().activeCount == 0) {
+          _loadFiles(); 
+        }
       }
     } catch (e) {
       if (!task.isCancelled) task.error(e.toString());
@@ -717,97 +775,124 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: _isSearching 
-          ? TextField(
-              autofocus: true,
-              style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color),
-              decoration: InputDecoration(hintText: '搜索当前目录文件...', border: InputBorder.none),
-              onChanged: (val) => setState(() => _searchQuery = val),
-            )
-          : Text('OSCA - ${_currentPrefix.isEmpty ? '根目录' : _currentPrefix}', style: TextStyle(fontSize: 16)),
-        actions:[
-          // 1. 搜索按钮
-          IconButton(
-            icon: Icon(_isSearching ? Icons.close : Icons.search),
-            onPressed: () {
-              setState(() {
-                _isSearching = !_isSearching;
-                if (!_isSearching) _searchQuery = ''; // 关闭时清空搜索
-              });
-            },
-          ),
-          
-          // 2. 创建文件夹按钮
-          IconButton(icon: Icon(Icons.create_new_folder), onPressed: _handleCreateFolder),
-          
-          // 3. 上传按钮
-          IconButton(icon: Icon(Icons.upload), onPressed: _isLoading ? null : _handleUpload),
-          
-          // 4. [最核心的入口]：任务中心 (带红点角标)
-          Consumer<TransferManager>(
-            builder: (context, manager, _) => IconButton(
-              icon: Stack(
-                clipBehavior: Clip.none,
-                children:[
-                  Icon(Icons.swap_vert), // 上下文交换图标
-                  if (manager.activeCount > 0)
-                    Positioned(
-                      right: -4, top: -4,
-                      child: CircleAvatar(
-                        radius: 7, backgroundColor: Colors.red,
-                        child: Text('${manager.activeCount}', style: TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold)),
-                      )
-                    )
-                ]
-              ),
-              onPressed: () => _showTaskCenter(),
+      // [重构] 动态 AppBar：根据是否进入批量选择模式渲染不同的顶部栏
+      appBar: _isSelectMode
+        ? AppBar(
+            leading: IconButton(
+              icon: Icon(Icons.close),
+              onPressed: () {
+                setState(() {
+                  _isSelectMode = false;
+                  _selectedFiles.clear();
+                });
+              },
             ),
+            title: Text('已选择 ${_selectedFiles.length} 项'),
+            actions:[
+              IconButton(
+                icon: Icon(Icons.download),
+                tooltip: '批量下载',
+                onPressed: _selectedFiles.isNotEmpty ? _handleBatchDownload : null,
+              ),
+              // 若后期需要支持批量删除，可在此处增加 Icons.delete 的入口
+            ],
+          )
+        : AppBar(
+            title: _isSearching 
+              ? TextField(
+                  autofocus: true,
+                  style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color),
+                  decoration: InputDecoration(hintText: '搜索当前目录文件...', border: InputBorder.none),
+                  onChanged: (val) => setState(() => _searchQuery = val),
+                )
+              : Text('OSCA - ${_currentPrefix.isEmpty ? '根目录' : _currentPrefix}', style: TextStyle(fontSize: 16)),
+            actions:[
+              // [新增] 批量操作入口
+              IconButton(
+                icon: Icon(Icons.checklist),
+                tooltip: '批量操作',
+                onPressed: () => setState(() => _isSelectMode = true),
+              ),
+              IconButton(
+                icon: Icon(_isSearching ? Icons.close : Icons.search),
+                onPressed: () {
+                  setState(() {
+                    _isSearching = !_isSearching;
+                    if (!_isSearching) _searchQuery = ''; 
+                  });
+                },
+              ),
+              IconButton(icon: Icon(Icons.create_new_folder), onPressed: _handleCreateFolder),
+              IconButton(icon: Icon(Icons.upload), onPressed: _isLoading ? null : _handleUpload),
+              Consumer<TransferManager>(
+                builder: (context, manager, _) => IconButton(
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children:[
+                      Icon(Icons.swap_vert), 
+                      if (manager.activeCount > 0)
+                        Positioned(
+                          right: -4, top: -4,
+                          child: CircleAvatar(
+                            radius: 7, backgroundColor: Colors.red,
+                            child: Text('${manager.activeCount}', style: TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold)),
+                          )
+                        )
+                    ]
+                  ),
+                  onPressed: () => _showTaskCenter(),
+                ),
+              ),
+              IconButton(
+                icon: Icon(Icons.insert_link),
+                tooltip: '外链管理',
+                onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ShareManagerPage())),
+              ),
+              IconButton(
+                icon: Icon(Icons.settings),
+                onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ConfigPage())),
+              ),
+            ],
           ),
-          
-          // 5. 外链管理入口
-          IconButton(
-            icon: Icon(Icons.insert_link), // 链条图标
-            tooltip: '外链管理',
-            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ShareManagerPage())),
-          ),
-          
-          // 6. 设置页入口
-          IconButton(
-            icon: Icon(Icons.settings),
-            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (context) => ConfigPage())),
-          ),
-        ],
-      ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : ListView.builder(
-              itemCount: _filteredFiles.length, // [修改]: 使用过滤后的数组
+              itemCount: _filteredFiles.length,
               itemBuilder: (context, index) {
-                final item = _filteredFiles[index]; // [修改]: 取出过滤后的 Item
+                final item = _filteredFiles[index];
+                final bool isSelected = _selectedFiles.contains(item['key']);
                 
-                // 1. 基础卡片 Widget
+                // 1. 基础卡片 Widget (增加选中态背板与复选框)
                 Widget card = Card(
+                  color: isSelected ? Colors.blue.withOpacity(0.1) : null,
                   margin: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                   child: ListTile(
-                    leading: Icon(
-                      item['isDir'] ? Icons.folder : Icons.insert_drive_file,
-                      color: item['isDir'] ? Colors.orange : Colors.blue,
-                    ),
+                    // [新增] 多选模式下展示复选框，文件夹暂不支持批量操作
+                    leading: _isSelectMode && !item['isDir']
+                      ? Checkbox(
+                          value: isSelected,
+                          onChanged: (val) {
+                            setState(() {
+                              if (val == true) _selectedFiles.add(item['key']);
+                              else _selectedFiles.remove(item['key']);
+                            });
+                          },
+                        )
+                      : Icon(
+                          item['isDir'] ? Icons.folder : Icons.insert_drive_file,
+                          color: item['isDir'] ? Colors.orange : Colors.blue,
+                        ),
                     title: Text(item['name']),
-                    // 使用格式化后的大小
                     subtitle: item['isDir'] ? null : Text(_formatFileSize(item['size'])),
-                    trailing: Row(
+                    // 批量模式下屏蔽单条目的操作按钮区，保持视觉清晰
+                    trailing: _isSelectMode ? null : Row(
                       mainAxisSize: MainAxisSize.min,
                       children:[
-                        // ... 保留前面的 属性、下载、删除 按钮 ...
                         IconButton(
                           icon: Icon(Icons.info_outline, color: Colors.green),
                           tooltip: '属性与编辑',
                           onPressed: () => _showPropertiesDialog(item),
                         ),
-                        
-                        //[新增]: 复制外链按钮
                         if (!item['isDir'])
                           IconButton(
                             icon: Icon(Icons.share, color: Colors.purple),
@@ -818,7 +903,6 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                               _showMsg("专属外链已复制！您可在外链管理中查看");
                             },
                           ),
-
                         if (!item['isDir'])
                           IconButton(
                             icon: Icon(Icons.download, color: Colors.blue),
@@ -835,22 +919,38 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                       ],
                     ),
                     onTap: () {
-                      if (item['isDir']) {
+                      if (_isSelectMode && !item['isDir']) {
+                        // 在多选模式下，点击卡片也可切换选中状态
+                        setState(() {
+                          if (isSelected) _selectedFiles.remove(item['key']);
+                          else _selectedFiles.add(item['key']);
+                        });
+                      } else if (!_isSelectMode && item['isDir']) {
+                        // 常规模式下的文件夹跳转
                         setState(() {
                           _currentPrefix = item['key'];
-                          _isSearching = false; // 进入新目录时重置搜索
+                          _isSearching = false; 
                           _searchQuery = '';
                         });
                         _loadFiles();
                       }
                     },
+                    // [新增] 长按快速进入批量选择模式
+                    onLongPress: () {
+                      if (!_isSelectMode && !item['isDir']) {
+                        setState(() {
+                          _isSelectMode = true;
+                          _selectedFiles.add(item['key']);
+                        });
+                      }
+                    },
                   ),
                 );
 
-                // 2. 文件夹作为接收目标 (DragTarget)
+                // 2. 文件夹作为接收目标 (DragTarget) 不变
                 if (item['isDir']) {
                   return DragTarget<Map<String, dynamic>>(
-                    onWillAccept: (data) => data != null && !data['isDir'], // 仅允许文件拖入
+                    onWillAccept: (data) => data != null && !data['isDir'],
                     onAccept: (data) async {
                       setState(() => _isLoading = true);
                       try {
@@ -865,7 +965,6 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                     },
                     builder: (context, candidateData, rejectedData) {
                       return Container(
-                        // 拖入时高亮显示
                         decoration: BoxDecoration(
                           border: candidateData.isNotEmpty ? Border.all(color: Colors.blue, width: 2) : null,
                         ),
@@ -874,22 +973,24 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                     },
                   );
                 } 
-                // 3. 文件作为可拖拽源 (LongPressDraggable)
+                // 3. 文件作为可拖拽源 (多选模式下禁用拖动，防止冲突)
                 else {
-                  return LongPressDraggable<Map<String, dynamic>>(
-                    data: item,
-                    feedback: Material(
-                      elevation: 8,
-                      borderRadius: BorderRadius.circular(8),
-                      child: Container(
-                        padding: EdgeInsets.all(16),
-                        decoration: BoxDecoration(color: Colors.blue.withOpacity(0.9), borderRadius: BorderRadius.circular(8)),
-                        child: Text('移动: ${item['name']}', style: TextStyle(color: Colors.white)),
-                      ),
-                    ),
-                    childWhenDragging: Opacity(opacity: 0.3, child: card),
-                    child: card,
-                  );
+                  return _isSelectMode
+                    ? card 
+                    : LongPressDraggable<Map<String, dynamic>>(
+                        data: item,
+                        feedback: Material(
+                          elevation: 8,
+                          borderRadius: BorderRadius.circular(8),
+                          child: Container(
+                            padding: EdgeInsets.all(16),
+                            decoration: BoxDecoration(color: Colors.blue.withOpacity(0.9), borderRadius: BorderRadius.circular(8)),
+                            child: Text('移动: ${item['name']}', style: TextStyle(color: Colors.white)),
+                          ),
+                        ),
+                        childWhenDragging: Opacity(opacity: 0.3, child: card),
+                        child: card,
+                      );
                 }
               },
             ),
@@ -900,6 +1001,9 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                   _currentPrefix = _currentPrefix.substring(0, _currentPrefix.lastIndexOf('/', _currentPrefix.length - 2) + 1);
                   _isSearching = false; 
                   _searchQuery = '';
+                  // 返回上层目录时退出选择模式
+                  _isSelectMode = false;
+                  _selectedFiles.clear();
                 });
                 _loadFiles();
               },
